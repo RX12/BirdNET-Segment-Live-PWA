@@ -35,7 +35,7 @@ module.exports = function (eleventyConfig) {
   });
 
   return {
-    pathPrefix: "/real-time-pwa/",
+    pathPrefix: "/BirdNET-Segment-Live-PWA/",
     dir: { input: "src", includes: "_includes", output: "_site" },
     markdownTemplateEngine: "njk",
     htmlTemplateEngine: "njk",
