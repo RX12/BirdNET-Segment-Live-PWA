@@ -32,6 +32,9 @@
   let scanTimeSec = 0;           // Simulated time in seconds
   let scanDurationSec = 0;
   let simulatedEpochStart = 1000000000000; // Base epoch for simulation
+  let activePipelineARequests = 0;
+  let activePipelineBRequests = 0;
+  let isTimelineFeedFinished = false;
 
   // Consensus state maps
   let verifiedDetections = new Map(); // scientificName -> { confidence, audioBuffer, timestamp }
@@ -383,6 +386,10 @@
     scanStatusText.textContent = "Spawning Web Workers...";
     logConsole("System", "Starting offline consensus scan...", "info");
 
+    activePipelineARequests = 0;
+    activePipelineBRequests = 0;
+    isTimelineFeedFinished = false;
+
     // Fetch settings threshold if available
     try {
       const storedThreshold = localStorage.getItem("bn_threshold");
@@ -489,10 +496,34 @@
       }, [customModelBytes.slice(0)]);
     }
 
+    // Determine if we need to run Pipeline B immediately on short files
+    let runPipelineBImmediately = false;
+    if (scanDurationSec < pipelineBWindow) {
+      runPipelineBImmediately = true;
+    }
+    
+    if (runPipelineBImmediately) {
+      const copy = new Float32Array(audioBuffer48k);
+      const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
+      activePipelineBRequests++;
+      segmentationWorker.postMessage({
+        type: "PROCESS_SEGMENT",
+        payload: {
+          segmentId: `seg-upload-short-${simulatedTimestamp}`,
+          timestamp: simulatedTimestamp,
+          sampleRate: SAMPLE_RATE,
+          audioBuffer: copy,
+          meta: {}
+        }
+      }, [copy.buffer]);
+      logConsole("Pipeline B", `Triggered single segment run for short audio file (duration: ${scanDurationSec.toFixed(1)}s)`, "info");
+    }
+
     // Setup Worker Events
     liveWorker.onmessage = (e) => {
       const data = e.data || {};
       if (data.message === "pooled" && Array.isArray(data.pooled)) {
+        activePipelineARequests--;
         // Register detections in pendingDetections mapping to the scanner timeline
         const scanTimestamp = simulatedEpochStart + scanTimeSec * 1000;
         let maxConf = 0;
@@ -522,10 +553,13 @@
         });
 
         renderDetections();
+        checkIfScanFinished();
       } else if (data.message === "loaded") {
         logConsole("Pipeline A", "Live Worker loaded and warmed up successfully.", "success");
       } else if (data.message === "worker_error") {
+        activePipelineARequests--;
         logConsole("Pipeline A", `Error: ${data.error}`, "error");
+        checkIfScanFinished();
       }
     };
 
@@ -535,9 +569,11 @@
       if (type === "PIPELINE_STATUS") {
         logConsole("Pipeline B", `Status update: ${payload.message}`, "warning");
       } else if (type === "SEGMENT_RESULT") {
+        activePipelineBRequests--;
         const { segmentId, timestamp, results, error } = payload || {};
         if (error) {
           logConsole("Pipeline B", `Error in segment ${segmentId}: ${error}`, "error");
+          checkIfScanFinished();
           return;
         }
 
@@ -588,6 +624,7 @@
             renderDetections();
           }
         }
+        checkIfScanFinished();
       }
     };
 
@@ -609,7 +646,57 @@
       scanTimeSec += timeStepSec;
       
       if (scanTimeSec > scanDurationSec) {
-        completeScan();
+        clearInterval(scanIntervalId);
+        scanIntervalId = null;
+        
+        // Post one final Pipeline A slice for the very end of the file if duration >= 3.0
+        if (scanDurationSec >= 3.0) {
+          const startSample = audioBuffer48k.length - WINDOW_SAMPLES;
+          const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
+          const copy = new Float32Array(slice);
+          activePipelineARequests++;
+          liveWorker.postMessage({
+            message: "predict",
+            pcmAudio: copy,
+            overlapSec: 1.5,
+            sensitivity: 1.0
+          }, [copy.buffer]);
+        } else {
+          // If the file is shorter than 3.0s, pad it to 3.0s and run Pipeline A once
+          const slice = new Float32Array(WINDOW_SAMPLES);
+          slice.set(audioBuffer48k);
+          activePipelineARequests++;
+          liveWorker.postMessage({
+            message: "predict",
+            pcmAudio: slice,
+            overlapSec: 1.5,
+            sensitivity: 1.0
+          });
+        }
+
+        // Post one final Pipeline B slice for the very end of the file if duration >= pipelineBWindow
+        if (scanDurationSec >= pipelineBWindow) {
+          const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
+          const startSample = audioBuffer48k.length - windowSamples;
+          const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
+          const copy = new Float32Array(slice);
+          activePipelineBRequests++;
+          
+          const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
+          segmentationWorker.postMessage({
+            type: "PROCESS_SEGMENT",
+            payload: {
+              segmentId: `seg-upload-final-${simulatedTimestamp}`,
+              timestamp: simulatedTimestamp,
+              sampleRate: SAMPLE_RATE,
+              audioBuffer: copy,
+              meta: {}
+            }
+          }, [copy.buffer]);
+        }
+
+        isTimelineFeedFinished = true;
+        checkIfScanFinished();
         return;
       }
 
@@ -630,6 +717,7 @@
           const slice = audioBuffer48k.subarray(startSample, startSample + WINDOW_SAMPLES);
           // Transfer copy to worker
           const copy = new Float32Array(slice);
+          activePipelineARequests++;
           liveWorker.postMessage({
             message: "predict",
             pcmAudio: copy,
@@ -672,6 +760,7 @@
             const copy = new Float32Array(slice);
             const simulatedTimestamp = simulatedEpochStart + scanTimeSec * 1000;
             
+            activePipelineBRequests++;
             segmentationWorker.postMessage({
               type: "PROCESS_SEGMENT",
               payload: {
@@ -720,6 +809,18 @@
     if (scanStatusText) {
       scanStatusText.textContent = `Completed (${scanDurationSec.toFixed(1)}s)`;
     }
+    
+    // Force progress UI to 100% on complete
+    if (scanProgressBar) {
+      scanProgressBar.style.width = "100%";
+    }
+    if (scanProgressText) {
+      scanProgressText.textContent = "100%";
+    }
+    if (scanPlayhead) {
+      scanPlayhead.style.left = "100%";
+    }
+
     // Reconcile remaining unverified elements
     pendingDetections.forEach((detectedAt, sciName) => {
       logConsole("Consensus", `CLEANUP: Removing unverified species: ${sciName}`, "error");
@@ -727,6 +828,12 @@
     });
     pendingDetections.clear();
     renderDetections();
+  }
+
+  function checkIfScanFinished() {
+    if (isTimelineFeedFinished && activePipelineARequests === 0 && activePipelineBRequests === 0) {
+      completeScan();
+    }
   }
 
   /* ==========================================================================

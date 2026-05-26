@@ -98,8 +98,9 @@ class ONNXAudioSeparator extends AudioSeparator {
         }
 
         try {
-            const inputTensor = new ort.Tensor('float32', audioBuffer, [1, audioBuffer.length]);
-            const feeds = { input: inputTensor }; // Replace with actual input node name
+            const inputTensor = new ort.Tensor('float32', audioBuffer, [1, 1, audioBuffer.length]);
+            const inputName = this.session.inputNames[0];
+            const feeds = { [inputName]: inputTensor };
             const results = await this.session.run(feeds);
             
             const outputNames = Object.keys(results);
