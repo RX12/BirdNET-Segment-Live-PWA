@@ -25,9 +25,12 @@ class AudioProcessor extends AudioWorkletProcessor {
             for (let i = 0; i < channelData.length; i++) {
                 this._buffer[this._index++] = channelData[i];
 
-                // When buffer is full, flush to main thread
+                // When buffer is full, flush to main thread via Transferable
                 if (this._index >= this.bufferSize) {
-                    this.port.postMessage(this._buffer);
+                    // Copy into a new buffer and transfer ownership (zero-copy)
+                    // to avoid structural cloning overhead on the audio render thread.
+                    const copy = new Float32Array(this._buffer);
+                    this.port.postMessage(copy, [copy.buffer]);
                     this._index = 0;
                 }
             }

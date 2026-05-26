@@ -16,6 +16,7 @@ permalink: "/"
     <div class="d-flex align-items-center gap-2">
       <div id="listeningIndicator" class="spinner-grow text-danger spinner-grow-sm d-none" role="status"></div>
       <span class="small text-muted" id="statusText" data-i18n="status_init">Tap 'Start' to record</span>
+      <span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10 d-none" id="webgpuWarning" style="font-size: 0.7rem;"><i class="bi bi-cpu me-1"></i>WASM Fallback</span>
     </div>
     <button
       id="settingsToggle"

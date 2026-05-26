@@ -42,8 +42,12 @@ const CORE_URLS = [
   "vendor/d3/d3.min.js",
   "vendor/bootstrap/bootstrap.bundle.min.js",
   "js/app.js",
-  "js/birdnet-worker.js",
+  "js/audio-router.js",
+  "js/live-worker.js",
+  "js/segmentation-worker.js",
   "js/tfjs-4.14.0.min.js",
+  "js/tf-tflite.min.js",
+  "js/ort.min.js",
   "locales/en.json",
   "locales/de.json",
   "locales/fr.json",
@@ -56,6 +60,23 @@ const CORE_URLS = [
 
 // Model Files & Labels (Large, rarely changed)
 const MODEL_URLS = [
+  "models/BirdNET_GLOBAL_6K_V2.4_Model_FP32.tflite",
+  "models/biocppnet.onnx",
+  "tflite-wasm/tflite_web_api_cc.js",
+  "tflite-wasm/tflite_web_api_cc.wasm",
+  "tflite-wasm/tflite_web_api_cc_simd.js",
+  "tflite-wasm/tflite_web_api_cc_simd.wasm",
+  "tflite-wasm/tflite_web_api_cc_simd_threaded.js",
+  "tflite-wasm/tflite_web_api_cc_simd_threaded.wasm",
+  "tflite-wasm/tflite_web_api_cc_simd_threaded.worker.js",
+  "tflite-wasm/tflite_web_api_cc_threaded.js",
+  "tflite-wasm/tflite_web_api_cc_threaded.wasm",
+  "tflite-wasm/tflite_web_api_cc_threaded.worker.js",
+  "tflite-wasm/tflite_web_api_client.js",
+  "onnx-wasm/ort-wasm-simd-threaded.wasm",
+  "onnx-wasm/ort-wasm-simd-threaded.jsep.wasm",
+  "onnx-wasm/ort-wasm-simd-threaded.jspi.wasm",
+  "onnx-wasm/ort-wasm-simd-threaded.asyncify.wasm",
   "models/birdnet/group1-shard1of13.bin",
   "models/birdnet/group1-shard2of13.bin",
   "models/birdnet/group1-shard3of13.bin",
@@ -90,20 +111,48 @@ self.addEventListener("install", (event) => {
   if (!ENABLE_CACHING) return;
 
   event.waitUntil((async () => {
-    // 1. Cache App Core
+    // 1. Cache App Core — individually to prevent one failed asset from
+    //    rejecting the entire install (critical on flaky mobile networks).
     const appCache = await caches.open(APP_CACHE_NAME);
-    await appCache.addAll(CORE_URLS);
+    for (const url of CORE_URLS) {
+      try {
+        const resp = await fetchWithRetry(url, { cache: "no-cache" }, 2);
+        await appCache.put(url, resp);
+      } catch (e) {
+        console.warn("[SW] Core asset cache failed (non-fatal):", url, e.message);
+      }
+    }
     
     // 2. Cache Model (separately to avoid re-downloading on app updates)
-    const modelCache = await caches.open(MODEL_CACHE_NAME);
-    for (const url of MODEL_URLS) {
-      const match = await modelCache.match(url);
-      if (!match) {
-        try {
-          const resp = await fetch(url, { cache: "no-cache" });
-          if (resp.ok) await modelCache.put(url, resp);
-        } catch (e) {
-          console.warn("[SW] Model precache skipped:", url);
+    //    MOBILE FIX: Check storage quota before downloading ~100MB of models.
+    //    iOS Safari enforces strict per-origin storage limits and may evict
+    //    caches proactively on low-storage devices.
+    let hasQuota = true;
+    if (navigator.storage && navigator.storage.estimate) {
+      try {
+        const estimate = await navigator.storage.estimate();
+        const availableBytes = (estimate.quota || 0) - (estimate.usage || 0);
+        const MIN_REQUIRED_BYTES = 150 * 1024 * 1024; // 150 MB headroom for all models
+        if (availableBytes < MIN_REQUIRED_BYTES) {
+          console.warn(`[SW] Insufficient storage for model cache. Available: ${(availableBytes / 1024 / 1024).toFixed(1)} MB, Required: ${(MIN_REQUIRED_BYTES / 1024 / 1024).toFixed(0)} MB. Skipping model precache.`);
+          hasQuota = false;
+        }
+      } catch (e) {
+        console.warn("[SW] storage.estimate() failed, proceeding with model cache:", e);
+      }
+    }
+
+    if (hasQuota) {
+      const modelCache = await caches.open(MODEL_CACHE_NAME);
+      for (const url of MODEL_URLS) {
+        const match = await modelCache.match(url);
+        if (!match) {
+          try {
+            const resp = await fetchWithRetry(url, { cache: "no-cache" }, 3);
+            await modelCache.put(url, resp);
+          } catch (e) {
+            console.error("[SW] Model precache permanently failed:", url, e);
+          }
         }
       }
     }
@@ -228,6 +277,21 @@ async function purgeAllCaches() {
   const keys = await caches.keys();
   await Promise.all(keys.map(k => caches.delete(k)));
   console.log("[SW] Caches purged.");
+}
+
+async function fetchWithRetry(url, options = {}, retries = 3) {
+  try {
+    const resp = await fetch(url, options);
+    if (!resp.ok) throw new Error(`HTTP status ${resp.status}`);
+    return resp;
+  } catch (err) {
+    if (retries > 0) {
+      console.warn(`[SW] Fetch failed for ${url}. Retrying... (${retries} attempts left). Error:`, err);
+      await new Promise(r => setTimeout(r, 1000));
+      return fetchWithRetry(url, options, retries - 1);
+    }
+    throw err;
+  }
 }
 
 self.addEventListener("message", (event) => {

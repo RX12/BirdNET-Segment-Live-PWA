@@ -12,8 +12,10 @@
   },
   "dependencies": {
     "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-tflite": "^0.0.1-alpha.10",
     "bootstrap": "^5.3.8",
     "bootstrap-icons": "^1.13.1",
-    "d3": "^7.9.0"
+    "d3": "^7.9.0",
+    "onnxruntime-web": "^1.26.0"
   }
 }

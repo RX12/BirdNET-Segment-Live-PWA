@@ -48,13 +48,13 @@ let translations = {};
 // Audio & Worker State
 let isListening = false;
 let workerReady = false;
-let birdnetWorker = null;
+let liveWorker = null;
+let segmentationWorker = null;
+let audioRouter = null;
 let audioContext;
 let workletNode;
 let gainNode;
 let highPassFilterNode;
-let circularBuffer;
-let circularWriteIndex = 0;
 let currentStream;
 
 // Inference State
@@ -62,6 +62,11 @@ let lastInferenceStart = 0;
 let lastInferenceMs = null;
 let recentInferenceSets = []; // Buffer for temporal pooling
 let latestDetections = [];
+let verifiedDetections = new Map();
+let pendingDetections = new Map();
+let playbackAudioContext = null;
+let activeAudioSource = null;
+let currentlyPlayingSpecies = null;
 
 // Spectrogram State
 let spectroCanvas, spectroCtx;
@@ -250,6 +255,13 @@ const settingsOverlayEl = () => document.getElementById("settingsOverlay");
    ========================================================================== */
 
 document.addEventListener("DOMContentLoaded", () => {
+  // Check WebGPU availability for Pipeline B
+  if (!navigator.gpu) {
+    console.warn("[App] WebGPU is not supported. Pipeline B will run on CPU WebAssembly fallback.");
+    const warningEl = document.getElementById("webgpuWarning");
+    if (warningEl) warningEl.classList.remove("d-none");
+  }
+
   updateColormap(colormapName);
 
   // Initialize Language
@@ -298,28 +310,37 @@ document.addEventListener("DOMContentLoaded", () => {
    ========================================================================== */
 
 function initWorker(langOverride) {
-  if (birdnetWorker) {
-    try { birdnetWorker.terminate(); } catch (_) {}
-    birdnetWorker = null;
+  if (liveWorker) {
+    try { liveWorker.terminate(); } catch (_) {}
+    liveWorker = null;
     workerReady = false;
-    
-    // Disable record button while reloading
-    const btn = recordButtonEl();
-    if (btn) btn.disabled = true;
   }
+  if (segmentationWorker) {
+    try { segmentationWorker.terminate(); } catch (_) {}
+    segmentationWorker = null;
+  }
+  if (audioRouter) {
+    audioRouter.stop();
+    audioRouter = null;
+  }
+  
+  // Disable record button while reloading
+  const btn = recordButtonEl();
+  if (btn) btn.disabled = true;
   
   const prefix = (window.PATH_PREFIX || "/");
   const tfPath = prefix + "js/tfjs-4.14.0.min.js";
   const root   = prefix + "models";
   const lang   = langOverride || currentLabelLang || (navigator.language || "en-US");
-  const params = new URLSearchParams({ tf: tfPath, root, lang });
+  const params = new URLSearchParams({ tf: tfPath, root, lang, prefix });
   
   const status = statusEl();
   if (status) updateStatus("status_loading_percent", 0);
   
-  birdnetWorker = new Worker(prefix + "js/birdnet-worker.js?" + params.toString());
+  liveWorker = new Worker(prefix + "js/live-worker.js?" + params.toString());
+  segmentationWorker = new Worker(prefix + "js/segmentation-worker.js?" + params.toString());
 
-  birdnetWorker.onmessage = (event) => {
+  liveWorker.onmessage = (event) => {
     const data = event.data || {};
     switch (data.message) {
       case "load_model":
@@ -360,6 +381,18 @@ function initWorker(langOverride) {
         const toRender = USE_TEMPORAL_POOL
           ? computeTemporalPooledDetections(recentInferenceSets)
           : data.pooled;
+
+        if (Array.isArray(toRender)) {
+          const now = Date.now();
+          toRender.forEach(p => {
+            if (p.confidence >= detectionThreshold && p.scientificName) {
+              if (!verifiedDetections.has(p.scientificName) && !pendingDetections.has(p.scientificName)) {
+                pendingDetections.set(p.scientificName, now);
+              }
+            }
+          });
+        }
+
         renderDetections(toRender);
         
         if (isListening && lastInferenceStart) {
@@ -379,15 +412,89 @@ function initWorker(langOverride) {
     }
   };
 
-  birdnetWorker.onerror = (err) => {
-    console.error("Worker error", err);
+  liveWorker.onerror = (err) => {
+    console.error("Live Worker error", err);
     updateStatus("status_worker_error");
+  };
+
+  segmentationWorker.onmessage = (event) => {
+    const { type, payload } = event.data || {};
+
+    // Release Pipeline B backpressure on any result/status message
+    if (audioRouter && (type === "SEGMENT_RESULT" || type === "PIPELINE_STATUS")) {
+      audioRouter.markSegmentComplete();
+    }
+
+    if (type === "PIPELINE_STATUS") {
+      // WebGPU downgrade notification from segmentation worker
+      const { status, message } = payload || {};
+      console.warn(`[App] Pipeline B status: ${status} — ${message}`);
+      const warningEl = document.getElementById("webgpuWarning");
+      if (warningEl) warningEl.classList.remove("d-none");
+      return;
+    }
+
+    if (type === "SEGMENT_RESULT") {
+      const { segmentId, timestamp, results, error } = payload || {};
+      if (error) {
+        console.error(`[App] Error in Pipeline B for segment ${segmentId}:`, error);
+        return;
+      }
+      console.log(`[App] Pipeline B result for segment ${segmentId}:`, results);
+      if (results && results.length > 0) {
+        let updated = false;
+        const verifiedThisSegment = new Set();
+
+        results.forEach(res => {
+          console.log(`[Consensus] Channel ${res.channelId} predictions:`, res.predictions);
+          if (res.predictions && res.predictions.length > 0) {
+            res.predictions.forEach(pred => {
+              if (pred.scientificName && pred.confidence >= detectionThreshold) {
+                console.log(`[Consensus] Verifying species: ${pred.scientificName} with confidence ${pred.confidence}`);
+                verifiedDetections.set(pred.scientificName, {
+                  confidence: pred.confidence,
+                  audioBuffer: res.audioBuffer, // Float32Array isolated channel audio
+                  timestamp: timestamp
+                });
+                verifiedThisSegment.add(pred.scientificName);
+                pendingDetections.delete(pred.scientificName);
+                updated = true;
+              }
+            });
+          }
+        });
+
+        // Timeline reconciliation: unmount unverified detections
+        const segmentStart = timestamp - 9000;
+        const segmentEnd = timestamp;
+
+        pendingDetections.forEach((detectedAt, sciName) => {
+          if (detectedAt >= segmentStart && detectedAt <= segmentEnd) {
+            if (!verifiedThisSegment.has(sciName)) {
+              console.log(`[Consensus] Rejecting false positive: ${sciName}`);
+              pendingDetections.delete(sciName);
+              // Remove from latestDetections
+              latestDetections = latestDetections.filter(d => d.scientificName !== sciName);
+              updated = true;
+            }
+          }
+        });
+
+        if (updated) {
+          renderDetections();
+        }
+      }
+    }
+  };
+
+  segmentationWorker.onerror = (err) => {
+    console.error("Segmentation Worker error", err);
   };
 }
 
 function requestSpeciesList() {
-  if (birdnetWorker) {
-    birdnetWorker.postMessage({ message: "get_species_list" });
+  if (liveWorker) {
+    liveWorker.postMessage({ message: "get_species_list" });
   }
 }
 
@@ -433,6 +540,15 @@ async function startListening() {
     updateStatus("status_requesting_mic");
     await requestWakeLock();
 
+    // MOBILE FIX: Create and resume AudioContext synchronously inside the
+    // user-gesture call stack, BEFORE the async getUserMedia() consent dialog.
+    // iOS Safari breaks the gesture chain after getUserMedia resolves, which
+    // causes AudioContext to remain permanently suspended.
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
     currentStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -443,7 +559,7 @@ async function startListening() {
       }
     });
 
-    await setupAudioGraphFromStream(currentStream);
+    await setupAudioGraphFromStream(currentStream, audioContext);
     updateStatus("status_listening");
   } catch (e) {
     console.error(e);
@@ -472,6 +588,9 @@ function stopListening() {
   // Reset State
   lastInferenceStart = 0;
   lastInferenceMs = null;
+  verifiedDetections.clear();
+  pendingDetections.clear();
+  stopIsolatedAudio();
 
   // Cleanup Audio
   if (currentStream) {
@@ -491,6 +610,10 @@ function stopListening() {
     highPassFilterNode.disconnect();
     highPassFilterNode = null;
   }
+  if (audioRouter) {
+    audioRouter.stop();
+    audioRouter = null;
+  }
   if (audioContext) {
     stopSpectrogram();
     audioContext.close();
@@ -498,10 +621,12 @@ function stopListening() {
   }
 }
 
-async function setupAudioGraphFromStream(stream) {
-  audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+async function setupAudioGraphFromStream(stream, ctx) {
+  // Use the pre-created AudioContext from the gesture handler.
+  // This ensures iOS Safari treats it as user-gesture-initiated.
+  audioContext = ctx;
 
-  // Resume if suspended (browser requirements)
+  // Double-check resume (belt-and-suspenders for edge cases)
   if (audioContext.state === "suspended") {
     await audioContext.resume();
   }
@@ -524,14 +649,25 @@ async function setupAudioGraphFromStream(stream) {
   // Start visualizer (Connect HighPass -> Spectrogram)
   startSpectrogram(highPassFilterNode);
 
-  // Setup circular buffer for inference
-  circularBuffer = new Float32Array(WINDOW_SAMPLES);
-  circularWriteIndex = 0;
-
   if (!audioContext.audioWorklet) {
     updateStatus("status_browser_old");
     return;
   }
+
+  // Setup AudioRouter (replacing manual RingBuffer & inference loop)
+  audioRouter = new AudioRouter(liveWorker, segmentationWorker, {
+    sampleRate: SAMPLE_RATE,
+    getSensitivity: () => sensitivity,
+    getGeoContext: () => {
+      return geolocation ? {
+        latitude: geolocation.lat,
+        longitude: geolocation.lon
+      } : {};
+    },
+    onInferenceStart: () => {
+      lastInferenceStart = performance.now();
+    }
+  });
 
   // Use AudioWorklet for raw audio access (Replaces ScriptProcessor)
   try {
@@ -542,15 +678,12 @@ async function setupAudioGraphFromStream(stream) {
 
     // Handle audio data from the worklet
     workletNode.port.onmessage = (event) => {
-      const input = event.data;
-      for (let i = 0; i < input.length; i++) {
-        circularBuffer[circularWriteIndex] = input[i];
-        circularWriteIndex = (circularWriteIndex + 1) % circularBuffer.length;
+      if (audioRouter) {
+        audioRouter.inputData(event.data);
       }
     };
 
     // Connect Gain -> Worklet -> Destination
-    // gainNode.connect(workletNode); // OLD
     highPassFilterNode.connect(workletNode);
     workletNode.connect(audioContext.destination);
 
@@ -560,51 +693,7 @@ async function setupAudioGraphFromStream(stream) {
     return;
   }
 
-  startInferenceLoop();
-}
-
-function startInferenceLoop() {
-  const tick = () => {
-    if (!isListening || !workerReady || !circularBuffer || !birdnetWorker) return;
-    
-    const windowed = getCurrentWindow();
-    if (windowed) {
-      const geoCtx = geolocation ? {
-        latitude: geolocation.lat,
-        longitude: geolocation.lon
-      } : {};
-      
-      lastInferenceStart = performance.now();
-      birdnetWorker.postMessage(
-        { 
-          message: "predict", 
-          pcmAudio: windowed, 
-          overlapSec: 1.5, 
-          sensitivity: sensitivity, // Pass sensitivity to worker
-          ...geoCtx 
-        },
-        [windowed.buffer]
-      );
-    }
-    
-    if (isListening) setTimeout(tick, inferenceInterval);
-  };
-  tick();
-}
-
-/**
- * Extracts the most recent 3 seconds of audio from the circular buffer.
- */
-function getCurrentWindow() {
-  if (!circularBuffer) return null;
-  const result = new Float32Array(WINDOW_SAMPLES);
-  let idx = circularWriteIndex; 
-  for (let i = 0; i < WINDOW_SAMPLES; i++) {
-    // Gain is already applied by GainNode, just clamp to prevent clipping artifacts in model
-    result[i] = Math.max(-1, Math.min(1, circularBuffer[idx]));
-    idx = (idx + 1) % circularBuffer.length;
-  }
-  return result;
+  audioRouter.start();
 }
 
 /* ==========================================================================
@@ -981,11 +1070,12 @@ function initUIControls() {
       currentLabelLang = langSelect.value;
       store.set("bn_lang", currentLabelLang);
       latestDetections = [];
+      verifiedDetections.clear();
       renderDetections([]);
       
-      if (birdnetWorker && workerReady) {
+      if (liveWorker && workerReady) {
         updateStatus("status_reloading_model");
-        birdnetWorker.postMessage({ message: 'load_labels', lang: currentLabelLang });
+        liveWorker.postMessage({ message: 'load_labels', lang: currentLabelLang });
       } else {
         initWorker(currentLabelLang);
       }
@@ -1119,24 +1209,71 @@ function renderDetections(pooled) {
     newKeys.add(key);
     let cardCol = existingCards.get(key);
 
+    const isVerified = verifiedDetections.has(scientificName);
+
+    const playBtnHtml = isVerified
+      ? (currentlyPlayingSpecies === scientificName
+          ? `<button class="btn btn-sm btn-outline-danger py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" onclick="stopIsolatedAudio()">
+               <i class="bi bi-stop-fill me-1"></i>Stop
+             </button>`
+          : `<button class="btn btn-sm btn-outline-primary py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" onclick="playIsolatedAudio('${scientificName.replace(/'/g, "\\'")}')">
+               <i class="bi bi-play-fill me-1"></i>Play Isolated
+             </button>`
+        )
+      : `<button class="btn btn-sm btn-outline-secondary py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" disabled>
+           <i class="bi bi-hourglass me-1"></i>Analyzing
+         </button>`;
+
     if (cardCol) {
       // UPDATE existing card (text only)
       const badge = cardCol.querySelector(".badge");
-      if (badge) badge.textContent = `${confPct}%`;
+      if (badge) {
+        if (isVerified) {
+          badge.innerHTML = `${confPct}%`;
+          badge.className = "badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-10 flex-shrink-0";
+        } else {
+          badge.innerHTML = `<i class="bi bi-arrow-repeat spin-icon me-1"></i>${confPct}% (Analyzing)`;
+          badge.className = "badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10 flex-shrink-0";
+        }
+      }
       
       const geoDiv = cardCol.querySelector(".geo-info");
       if (geoDiv) {
         if (geoInfo) geoDiv.innerHTML = `<i class="bi bi-geo-alt me-1"></i>${geoInfo}`;
         else geoDiv.innerHTML = "";
       }
+
+      const card = cardCol.querySelector(".card");
+      if (card) {
+        if (isVerified) {
+          card.classList.remove("card-pending");
+        } else {
+          if (!card.classList.contains("card-pending")) {
+            card.classList.add("card-pending");
+          }
+        }
+      }
+
+      const playBtnContainer = cardCol.querySelector(".play-btn-container");
+      if (playBtnContainer) {
+        playBtnContainer.innerHTML = playBtnHtml;
+      }
+
       container.appendChild(cardCol); // Re-order
     } else {
       // CREATE new card
       cardCol = document.createElement("div");
       cardCol.className = "col-md-6 col-lg-4 fade-in";
       cardCol.dataset.species = key;
+
+      const badgeHtml = isVerified
+        ? `<span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-10 flex-shrink-0">${confPct}%</span>`
+        : `<span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10 flex-shrink-0"><i class="bi bi-arrow-repeat spin-icon me-1"></i>${confPct}% (Analyzing)</span>`;
+
+      const cardPendingClass = isVerified ? "" : "card-pending";
+
       cardCol.innerHTML = `
-        <div class="card h-100 border-0 shadow-sm overflow-hidden">
+        <div class="card h-100 border-0 shadow-sm overflow-hidden ${cardPendingClass}">
           <div class="d-flex h-100">
             <div class="flex-shrink-0 position-relative" style="width: 90px; background-color: #f8f9fa;">
               <img src="${imgUrl}" 
@@ -1145,16 +1282,23 @@ function renderDetections(pooled) {
                    style="width: 100%; height: 100%; object-fit: cover;"
                    onerror="this.onerror=null; this.src='img/dummy.webp';">
             </div>
-            <div class="card-body py-2 px-3 flex-grow-1">
-              <div class="d-flex justify-content-between align-items-start mb-1">
-                <h6 class="card-title mb-0 fw-bold text-primary text-truncate me-2" style="min-width: 0; font-size: 0.95rem;" title="${commonName}">${commonName}</h6>
-                <span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-10 flex-shrink-0">
-                  ${confPct}%
-                </span>
+            <div class="card-body py-2 px-3 flex-grow-1 d-flex flex-column justify-content-between">
+              <div>
+                <div class="d-flex justify-content-between align-items-start mb-1">
+                  <h6 class="card-title mb-0 fw-bold text-primary text-truncate me-2" style="min-width: 0; font-size: 0.95rem;" title="${commonName}">${commonName}</h6>
+                  ${badgeHtml}
+                </div>
+                ${scientificName ? `<div class="text-muted fst-italic small mb-2 text-truncate" style="font-size: 0.8rem;">${scientificName}</div>` : ""}
               </div>
-              ${scientificName ? `<div class="text-muted fst-italic small mb-2 text-truncate" style="font-size: 0.8rem;">${scientificName}</div>` : ""}
-              <div class="small text-muted border-top pt-2 mt-1 geo-info">
-                ${geoInfo ? `<i class="bi bi-geo-alt me-1"></i>${geoInfo}` : ""}
+              <div>
+                <div class="d-flex justify-content-between align-items-center border-top pt-2 mt-1">
+                  <span class="small text-muted geo-info" style="font-size: 0.75rem;">
+                    ${geoInfo ? `<i class="bi bi-geo-alt me-1"></i>${geoInfo}` : ""}
+                  </span>
+                  <div class="play-btn-container">
+                    ${playBtnHtml}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1297,7 +1441,7 @@ function getGeolocation() {
 }
 
 function sendAreaScores() {
-  if (!birdnetWorker || !geolocation) return;
+  if (!liveWorker || !geolocation) return;
   const now = new Date();
   const startYear = new Date(now.getFullYear(), 0, 1);
   const week = Math.min(
@@ -1308,7 +1452,7 @@ function sendAreaScores() {
     )
   );
   const hour = now.getHours();
-  birdnetWorker.postMessage({
+  liveWorker.postMessage({
     message: "area-scores",
     latitude: geolocation.lat,
     longitude: geolocation.lon,
@@ -1408,3 +1552,62 @@ function computeTemporalPooledDetections(sets) {
   pooled.sort((a, b) => b.confidence - a.confidence);
   return pooled;
 }
+
+/* ==========================================================================
+   13. AUDIO PLAYBACK UTILITIES
+   ========================================================================== */
+
+function playIsolatedAudio(scientificName) {
+  if (currentlyPlayingSpecies === scientificName) {
+    stopIsolatedAudio();
+    return;
+  }
+
+  const verified = verifiedDetections.get(scientificName);
+  if (!verified || !verified.audioBuffer) return;
+
+  try {
+    stopIsolatedAudio();
+
+    if (!playbackAudioContext) {
+      playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    }
+    if (playbackAudioContext.state === "suspended") {
+      playbackAudioContext.resume();
+    }
+
+    const audioBuf = playbackAudioContext.createBuffer(1, verified.audioBuffer.length, 48000);
+    audioBuf.getChannelData(0).set(verified.audioBuffer);
+
+    const source = playbackAudioContext.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(playbackAudioContext.destination);
+    
+    source.onended = () => {
+      if (activeAudioSource === source) {
+        currentlyPlayingSpecies = null;
+        activeAudioSource = null;
+        renderDetections();
+      }
+    };
+
+    source.start();
+    activeAudioSource = source;
+    currentlyPlayingSpecies = scientificName;
+    renderDetections();
+  } catch (err) {
+    console.error("Failed to play isolated audio:", err);
+  }
+}
+
+function stopIsolatedAudio() {
+  if (activeAudioSource) {
+    try { activeAudioSource.stop(); } catch(e) {}
+    activeAudioSource = null;
+  }
+  currentlyPlayingSpecies = null;
+  renderDetections();
+}
+
+window.playIsolatedAudio = playIsolatedAudio;
+window.stopIsolatedAudio = stopIsolatedAudio;
