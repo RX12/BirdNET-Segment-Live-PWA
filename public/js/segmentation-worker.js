@@ -250,9 +250,23 @@ async function init() {
         if (separator !== 'custom') {
             isReady = true;
             console.log("[Segmentation Worker] Initialization complete and ready.");
+            self.postMessage({
+                type: "PIPELINE_STATUS",
+                payload: {
+                    status: "ready",
+                    message: "Segmentation Worker loaded and warmed up successfully."
+                }
+            });
         }
     } catch (err) {
         console.error("[Segmentation Worker] Initialization failed:", err);
+        self.postMessage({
+            type: "PIPELINE_STATUS",
+            payload: {
+                status: "error",
+                message: "Initialization failed: " + err.message
+            }
+        });
     }
 }
 
@@ -337,8 +351,22 @@ self.onmessage = async (event) => {
                 await separatorModel.loadModelFromBytes(modelBytes);
                 isReady = true;
                 console.log("[Segmentation Worker] Custom local model bytes loaded successfully. Worker ready.");
+                self.postMessage({
+                    type: "PIPELINE_STATUS",
+                    payload: {
+                        status: "ready",
+                        message: "Custom local model bytes loaded successfully. Worker ready."
+                    }
+                });
             } catch (err) {
                 console.error("[Segmentation Worker] Failed to load custom local model bytes:", err);
+                self.postMessage({
+                    type: "PIPELINE_STATUS",
+                    payload: {
+                        status: "error",
+                        message: "Failed to load custom local model bytes: " + err.message
+                    }
+                });
             }
         }
         return;

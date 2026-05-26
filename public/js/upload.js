@@ -26,6 +26,8 @@
 
   let liveWorker = null;
   let segmentationWorker = null;
+  let liveWorkerReady = false;
+  let segmentationWorkerReady = false;
   
   let isScanning = false;
   let scanIntervalId = null;
@@ -389,6 +391,8 @@
     activePipelineARequests = 0;
     activePipelineBRequests = 0;
     isTimelineFeedFinished = false;
+    liveWorkerReady = false;
+    segmentationWorkerReady = false;
 
     // Fetch settings threshold if available
     try {
@@ -496,29 +500,6 @@
       }, [customModelBytes.slice(0)]);
     }
 
-    // Determine if we need to run Pipeline B immediately on short files
-    let runPipelineBImmediately = false;
-    if (scanDurationSec < pipelineBWindow) {
-      runPipelineBImmediately = true;
-    }
-    
-    if (runPipelineBImmediately) {
-      const copy = new Float32Array(audioBuffer48k);
-      const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
-      activePipelineBRequests++;
-      segmentationWorker.postMessage({
-        type: "PROCESS_SEGMENT",
-        payload: {
-          segmentId: `seg-upload-short-${simulatedTimestamp}`,
-          timestamp: simulatedTimestamp,
-          sampleRate: SAMPLE_RATE,
-          audioBuffer: copy,
-          meta: {}
-        }
-      }, [copy.buffer]);
-      logConsole("Pipeline B", `Triggered single segment run for short audio file (duration: ${scanDurationSec.toFixed(1)}s)`, "info");
-    }
-
     // Setup Worker Events
     liveWorker.onmessage = (e) => {
       const data = e.data || {};
@@ -556,10 +537,17 @@
         checkIfScanFinished();
       } else if (data.message === "loaded") {
         logConsole("Pipeline A", "Live Worker loaded and warmed up successfully.", "success");
+        liveWorkerReady = true;
+        checkWorkersReadyAndStart();
       } else if (data.message === "worker_error") {
         activePipelineARequests--;
         logConsole("Pipeline A", `Error: ${data.error}`, "error");
-        checkIfScanFinished();
+        if (!liveWorkerReady || !segmentationWorkerReady) {
+          stopScan();
+          logConsole("System", "Scan failed: Pipeline A worker error during startup.", "error");
+        } else {
+          checkIfScanFinished();
+        }
       }
     };
 
@@ -567,7 +555,19 @@
       const { type, payload } = e.data || {};
       
       if (type === "PIPELINE_STATUS") {
-        logConsole("Pipeline B", `Status update: ${payload.message}`, "warning");
+        if (payload.status === "ready") {
+          logConsole("Pipeline B", "Pipeline B Worker loaded and warmed up successfully.", "success");
+          segmentationWorkerReady = true;
+          checkWorkersReadyAndStart();
+        } else if (payload.status === "error") {
+          logConsole("Pipeline B", `Initialization error: ${payload.message}`, "error");
+          if (!liveWorkerReady || !segmentationWorkerReady) {
+            stopScan();
+            logConsole("System", "Scan failed: Pipeline B worker error during startup.", "error");
+          }
+        } else {
+          logConsole("Pipeline B", `Status update: ${payload.message}`, "warning");
+        }
       } else if (type === "SEGMENT_RESULT") {
         activePipelineBRequests--;
         const { segmentId, timestamp, results, error } = payload || {};
@@ -628,143 +628,98 @@
       }
     };
 
-    // Get Scanning Speed pacing
-    const speedSelect = document.querySelector('input[name="scanSpeed"]:checked');
-    const speed = speedSelect ? speedSelect.value : "normal";
-    
-    let pacingMs = 500; // time interval for step executions
-    let timeStepSec = 0.5; // step increment in simulated seconds
-    if (speed === "fast") pacingMs = 50; // 10x faster
-    if (speed === "turbo") pacingMs = 5; // ~100x faster
+    function checkWorkersReadyAndStart() {
+      if (liveWorkerReady && segmentationWorkerReady) {
+        beginScan();
+      }
+    }
 
-    scanTimeSec = 0.0;
-    let nextPipelineBTime = pipelineBWindow;
-    maxLiveConfidenceInInterval = 0;
-    
-    // Start interval scan
-    scanIntervalId = setInterval(async () => {
-      scanTimeSec += timeStepSec;
+    function beginScan() {
+      scanStatusText.textContent = "Scanning...";
+      logConsole("System", "Both workers initialized. Commencing scan...", "info");
+
+      // Determine if we need to run Pipeline B immediately on short files
+      let runPipelineBImmediately = false;
+      if (scanDurationSec < pipelineBWindow) {
+        runPipelineBImmediately = true;
+      }
       
-      if (scanTimeSec > scanDurationSec) {
-        clearInterval(scanIntervalId);
-        scanIntervalId = null;
-        
-        // Post one final Pipeline A slice for the very end of the file if duration >= 3.0
-        if (scanDurationSec >= 3.0) {
-          const startSample = audioBuffer48k.length - WINDOW_SAMPLES;
-          const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
-          const copy = new Float32Array(slice);
-          activePipelineARequests++;
-          liveWorker.postMessage({
-            message: "predict",
-            pcmAudio: copy,
-            overlapSec: 1.5,
-            sensitivity: 1.0
-          }, [copy.buffer]);
-        } else {
-          // If the file is shorter than 3.0s, pad it to 3.0s and run Pipeline A once
-          const slice = new Float32Array(WINDOW_SAMPLES);
-          slice.set(audioBuffer48k);
-          activePipelineARequests++;
-          liveWorker.postMessage({
-            message: "predict",
-            pcmAudio: slice,
-            overlapSec: 1.5,
-            sensitivity: 1.0
-          });
-        }
-
-        // Post one final Pipeline B slice for the very end of the file if duration >= pipelineBWindow
-        if (scanDurationSec >= pipelineBWindow) {
-          const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
-          const startSample = audioBuffer48k.length - windowSamples;
-          const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
-          const copy = new Float32Array(slice);
-          activePipelineBRequests++;
-          
-          const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
-          segmentationWorker.postMessage({
-            type: "PROCESS_SEGMENT",
-            payload: {
-              segmentId: `seg-upload-final-${simulatedTimestamp}`,
-              timestamp: simulatedTimestamp,
-              sampleRate: SAMPLE_RATE,
-              audioBuffer: copy,
-              meta: {}
-            }
-          }, [copy.buffer]);
-        }
-
-        isTimelineFeedFinished = true;
-        checkIfScanFinished();
-        return;
+      if (runPipelineBImmediately) {
+        const copy = new Float32Array(audioBuffer48k);
+        const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
+        activePipelineBRequests++;
+        segmentationWorker.postMessage({
+          type: "PROCESS_SEGMENT",
+          payload: {
+            segmentId: `seg-upload-short-${simulatedTimestamp}`,
+            timestamp: simulatedTimestamp,
+            sampleRate: SAMPLE_RATE,
+            audioBuffer: copy,
+            meta: {}
+          }
+        }, [copy.buffer]);
+        logConsole("Pipeline B", `Triggered single segment run for short audio file (duration: ${scanDurationSec.toFixed(1)}s)`, "info");
       }
 
-      // Update UI Progress
-      const pct = (scanTimeSec / scanDurationSec) * 100;
-      scanPlayhead.style.left = `${pct}%`;
-      scanProgressBar.style.width = `${pct}%`;
-      scanProgressText.textContent = `${Math.min(100, Math.round(pct))}%`;
-      scanStatusText.textContent = `Scanning: ${formatTime(scanTimeSec)} / ${formatTime(scanDurationSec)}`;
+      // Get Scanning Speed pacing
+      const speedSelect = document.querySelector('input[name="scanSpeed"]:checked');
+      const speed = speedSelect ? speedSelect.value : "normal";
+      
+      let pacingMs = 500; // time interval for step executions
+      let timeStepSec = 0.5; // step increment in simulated seconds
+      if (speed === "fast") pacingMs = 50; // 10x faster
+      if (speed === "turbo") pacingMs = 5; // ~100x faster
 
-      // Calculate sample endpoints
-      const endSample = Math.round(scanTimeSec * SAMPLE_RATE);
-
-      // Pipeline A (Live): run every 1.0s on the last 3.0s of audio
-      if (Number.isInteger(scanTimeSec) && scanTimeSec >= 3.0) {
-        const startSample = endSample - WINDOW_SAMPLES;
-        if (startSample >= 0 && startSample + WINDOW_SAMPLES <= audioBuffer48k.length) {
-          const slice = audioBuffer48k.subarray(startSample, startSample + WINDOW_SAMPLES);
-          // Transfer copy to worker
-          const copy = new Float32Array(slice);
-          activePipelineARequests++;
-          liveWorker.postMessage({
-            message: "predict",
-            pcmAudio: copy,
-            overlapSec: 1.5,
-            sensitivity: 1.0
-          }, [copy.buffer]);
-        }
-      }
-
-      // Pipeline B (Segmented): run dynamically based on window and stride
-      if (scanTimeSec >= nextPipelineBTime - 0.001) {
-        const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
-        const startSample = endSample - windowSamples;
+      scanTimeSec = 0.0;
+      let nextPipelineBTime = pipelineBWindow;
+      maxLiveConfidenceInInterval = 0;
+      
+      // Start interval scan
+      scanIntervalId = setInterval(async () => {
+        scanTimeSec += timeStepSec;
         
-        if (startSample >= 0 && startSample + windowSamples <= audioBuffer48k.length) {
-          const slice = audioBuffer48k.subarray(startSample, startSample + windowSamples);
+        if (scanTimeSec > scanDurationSec) {
+          clearInterval(scanIntervalId);
+          scanIntervalId = null;
           
-          let bypassB = false;
-
-          // AAD Gate Check
-          if (aadEnabled) {
-            const rms = calculateRMS(slice);
-            const centroid = calculateSpectralCentroid(slice, SAMPLE_RATE);
-            if (rms < aadRmsThreshold || centroid < aadCentroidMin) {
-              logConsole("Pipeline B", `Bypassed via gate at ${formatTime(scanTimeSec)} (rms: ${rms.toFixed(4)} < ${aadRmsThreshold} OR centroid: ${Math.round(centroid)}Hz < ${aadCentroidMin}Hz)`, "info");
-              bypassB = true;
-            }
-          }
-
-          // Early Exit Check
-          if (!bypassB && earlyExitEnabled && maxLiveConfidenceInInterval >= earlyExitConfidence) {
-            logConsole("Pipeline B", `Bypassed via early exit at ${formatTime(scanTimeSec)} (max live confidence: ${(maxLiveConfidenceInInterval * 100).toFixed(1)}% >= ${(earlyExitConfidence * 100).toFixed(0)}%)`, "info");
-            bypassB = true;
-          }
-
-          maxLiveConfidenceInInterval = 0; // reset for next interval
-
-          if (!bypassB) {
-            // Transfer copy to worker
+          // Post one final Pipeline A slice for the very end of the file if duration >= 3.0
+          if (scanDurationSec >= 3.0) {
+            const startSample = audioBuffer48k.length - WINDOW_SAMPLES;
+            const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
             const copy = new Float32Array(slice);
-            const simulatedTimestamp = simulatedEpochStart + scanTimeSec * 1000;
-            
+            activePipelineARequests++;
+            liveWorker.postMessage({
+              message: "predict",
+              pcmAudio: copy,
+              overlapSec: 1.5,
+              sensitivity: 1.0
+            }, [copy.buffer]);
+          } else {
+            // If the file is shorter than 3.0s, pad it to 3.0s and run Pipeline A once
+            const slice = new Float32Array(WINDOW_SAMPLES);
+            slice.set(audioBuffer48k);
+            activePipelineARequests++;
+            liveWorker.postMessage({
+              message: "predict",
+              pcmAudio: slice,
+              overlapSec: 1.5,
+              sensitivity: 1.0
+            });
+          }
+
+          // Post one final Pipeline B slice for the very end of the file if duration >= pipelineBWindow
+          if (scanDurationSec >= pipelineBWindow) {
+            const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
+            const startSample = audioBuffer48k.length - windowSamples;
+            const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
+            const copy = new Float32Array(slice);
             activePipelineBRequests++;
+            
+            const simulatedTimestamp = simulatedEpochStart + scanDurationSec * 1000;
             segmentationWorker.postMessage({
               type: "PROCESS_SEGMENT",
               payload: {
-                segmentId: `seg-upload-${simulatedTimestamp}`,
+                segmentId: `seg-upload-final-${simulatedTimestamp}`,
                 timestamp: simulatedTimestamp,
                 sampleRate: SAMPLE_RATE,
                 audioBuffer: copy,
@@ -772,10 +727,89 @@
               }
             }, [copy.buffer]);
           }
+
+          isTimelineFeedFinished = true;
+          checkIfScanFinished();
+          return;
         }
-        nextPipelineBTime += pipelineBStride;
-      }
-    }, pacingMs);
+
+        // Update UI Progress
+        const pct = (scanTimeSec / scanDurationSec) * 100;
+        scanPlayhead.style.left = `${pct}%`;
+        scanProgressBar.style.width = `${pct}%`;
+        scanProgressText.textContent = `${Math.min(100, Math.round(pct))}%`;
+        scanStatusText.textContent = `Scanning: ${formatTime(scanTimeSec)} / ${formatTime(scanDurationSec)}`;
+
+        // Calculate sample endpoints
+        const endSample = Math.round(scanTimeSec * SAMPLE_RATE);
+
+        // Pipeline A (Live): run every 1.0s on the last 3.0s of audio
+        if (Number.isInteger(scanTimeSec) && scanTimeSec >= 3.0) {
+          const startSample = endSample - WINDOW_SAMPLES;
+          if (startSample >= 0 && startSample + WINDOW_SAMPLES <= audioBuffer48k.length) {
+            const slice = audioBuffer48k.subarray(startSample, startSample + WINDOW_SAMPLES);
+            // Transfer copy to worker
+            const copy = new Float32Array(slice);
+            activePipelineARequests++;
+            liveWorker.postMessage({
+              message: "predict",
+              pcmAudio: copy,
+              overlapSec: 1.5,
+              sensitivity: 1.0
+            }, [copy.buffer]);
+          }
+        }
+
+        // Pipeline B (Segmented): run dynamically based on window and stride
+        if (scanTimeSec >= nextPipelineBTime - 0.001) {
+          const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
+          const startSample = endSample - windowSamples;
+          
+          if (startSample >= 0 && startSample + windowSamples <= audioBuffer48k.length) {
+            const slice = audioBuffer48k.subarray(startSample, startSample + windowSamples);
+            
+            let bypassB = false;
+
+            // AAD Gate Check
+            if (aadEnabled) {
+              const rms = calculateRMS(slice);
+              const centroid = calculateSpectralCentroid(slice, SAMPLE_RATE);
+              if (rms < aadRmsThreshold || centroid < aadCentroidMin) {
+                logConsole("Pipeline B", `Bypassed via gate at ${formatTime(scanTimeSec)} (rms: ${rms.toFixed(4)} < ${aadRmsThreshold} OR centroid: ${Math.round(centroid)}Hz < ${aadCentroidMin}Hz)`, "info");
+                bypassB = true;
+              }
+            }
+
+            // Early Exit Check
+            if (!bypassB && earlyExitEnabled && maxLiveConfidenceInInterval >= earlyExitConfidence) {
+              logConsole("Pipeline B", `Bypassed via early exit at ${formatTime(scanTimeSec)} (max live confidence: ${(maxLiveConfidenceInInterval * 100).toFixed(1)}% >= ${(earlyExitConfidence * 100).toFixed(0)}%)`, "info");
+              bypassB = true;
+            }
+
+            maxLiveConfidenceInInterval = 0; // reset for next interval
+
+            if (!bypassB) {
+              // Transfer copy to worker
+              const copy = new Float32Array(slice);
+              const simulatedTimestamp = simulatedEpochStart + scanTimeSec * 1000;
+              
+              activePipelineBRequests++;
+              segmentationWorker.postMessage({
+                type: "PROCESS_SEGMENT",
+                payload: {
+                  segmentId: `seg-upload-${simulatedTimestamp}`,
+                  timestamp: simulatedTimestamp,
+                  sampleRate: SAMPLE_RATE,
+                  audioBuffer: copy,
+                  meta: {}
+                }
+              }, [copy.buffer]);
+            }
+          }
+          nextPipelineBTime += pipelineBStride;
+        }
+      }, pacingMs);
+    }
   }
 
   function stopScan() {
@@ -784,6 +818,8 @@
       scanIntervalId = null;
     }
     isScanning = false;
+    liveWorkerReady = false;
+    segmentationWorkerReady = false;
     if (scanBtn) {
       scanBtn.textContent = "Start Scan";
       scanBtn.className = "btn btn-sm btn-success";
