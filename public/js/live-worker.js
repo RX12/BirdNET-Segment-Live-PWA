@@ -61,7 +61,7 @@ async function init() {
   // 1. Load Main TFLite Model
   try {
     postMessage({ message: 'load_model', progress: 10 });
-    birdModel = await tflite.loadTFLiteModel(MODEL_PATH);
+    birdModel = await tflite.loadTFLiteModel(MODEL_PATH, { numThreads: 1 });
     postMessage({ message: 'load_model', progress: 70 });
   } catch (err) {
     console.error("[Live Worker] Failed to load TFLite model:", err);
@@ -71,11 +71,17 @@ async function init() {
 
   // 2. Warmup
   postMessage({ message: 'warmup', progress: 80 });
-  tf.tidy(() => {
-    const dummyInput = tf.zeros([1, WINDOW_SAMPLES], 'float32');
-    birdModel.predict(dummyInput);
-    dummyInput.dispose();
-  });
+  try {
+    tf.tidy(() => {
+      const dummyInput = tf.zeros([1, WINDOW_SAMPLES], 'float32');
+      birdModel.predict(dummyInput);
+      dummyInput.dispose();
+    });
+  } catch (err) {
+    console.error("[Live Worker] Warmup failed:", err);
+    postMessage({ message: 'worker_error', error: "Model warmup failed: " + err.message });
+    return;
+  }
 
   // 3. Load Geo Model (Optional)
   postMessage({ message: 'load_geomodel', progress: 90 });

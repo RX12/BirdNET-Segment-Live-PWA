@@ -172,15 +172,20 @@ async function init() {
 
         // 3. Load TFLite Classification Model
         console.log("[Segmentation Worker] Loading BirdNET FP32 model...");
-        classificationModel = await tflite.loadTFLiteModel(MODEL_PATH);
+        classificationModel = await tflite.loadTFLiteModel(MODEL_PATH, { numThreads: 1 });
         console.log("[Segmentation Worker] BirdNET FP32 model loaded successfully.");
 
         // Warmup classification model
-        tf.tidy(() => {
-            const dummyInput = tf.zeros([1, WINDOW_SAMPLES], 'float32');
-            classificationModel.predict(dummyInput);
-            dummyInput.dispose();
-        });
+        try {
+            tf.tidy(() => {
+                const dummyInput = tf.zeros([1, WINDOW_SAMPLES], 'float32');
+                classificationModel.predict(dummyInput);
+                dummyInput.dispose();
+            });
+        } catch (warmupErr) {
+            console.error("[Segmentation Worker] Warmup failed:", warmupErr);
+            throw warmupErr;
+        }
 
         isReady = true;
         console.log("[Segmentation Worker] Initialization complete and ready.");
