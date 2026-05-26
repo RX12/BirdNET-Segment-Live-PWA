@@ -1,0 +1,219 @@
+---
+title: BirdNET Live – Audio File Analyzer
+layout: layouts/base.njk
+permalink: "/upload/"
+---
+
+<div class="container py-4">
+  <!-- Title / Introduction Section -->
+  <div class="mb-4 text-center">
+    <h2 class="fw-bold text-primary mb-1"><i class="bi bi-file-earmark-music me-2"></i>Audio File Analyzer</h2>
+    <p class="text-muted">Upload an audio file (MP3, WAV, etc.) to analyze it offline using the dual-pipeline consensus engine.</p>
+  </div>
+
+  <div class="row g-4">
+    <!-- Left Column: Controls & Waveform & Detections -->
+    <div class="col-lg-8">
+      <!-- Upload Card -->
+      <div class="card border-0 shadow-sm mb-4 rounded-3 overflow-hidden">
+        <div class="card-body p-4 text-center border-dashed-custom" id="dropZone" style="border: 2px dashed #cbd5e1; cursor: pointer; border-radius: 12px;">
+          <input type="file" id="audioUpload" accept="audio/*" class="d-none">
+          <i class="bi bi-cloud-arrow-up-fill text-primary fs-1 mb-2 d-block"></i>
+          <h5 class="fw-semibold mb-1" id="uploadLabel">Drag & drop your audio file here</h5>
+          <p class="text-muted small mb-3">Supports MP3, WAV, M4A, OGG up to 50MB</p>
+          <button type="button" class="btn btn-primary px-4 btn-sm" onclick="document.getElementById('audioUpload').click()">
+            <i class="bi bi-folder2-open me-2"></i>Browse Files
+          </button>
+        </div>
+      </div>
+
+      <!-- Waveform & Playback Controls (Visible after upload) -->
+      <div id="analysisContainer" class="card border-0 shadow-sm mb-4 rounded-3 d-none">
+        <div class="card-body p-4">
+          <h6 class="fw-bold text-primary mb-3"><i class="bi bi-activity me-2"></i>Audio Waveform & Scan Timeline</h6>
+          
+          <div class="position-relative mb-3 bg-dark rounded overflow-hidden" style="height: 120px;">
+            <canvas id="waveformCanvas" class="position-absolute top-0 start-0 w-100 h-100"></canvas>
+            <div id="scanPlayhead" class="position-absolute top-0 bottom-0 bg-success opacity-75" style="width: 2px; left: 0%;"></div>
+          </div>
+
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
+              <button id="playbackBtn" class="btn btn-sm btn-outline-primary" disabled>
+                <i class="bi bi-play-fill me-1"></i>Listen to File
+              </button>
+              <button id="scanBtn" class="btn btn-sm btn-success">
+                <i class="bi bi-cpu me-1"></i>Start Scan
+              </button>
+            </div>
+
+            <!-- Separator Model Selection -->
+            <div class="d-flex align-items-center gap-2">
+              <span class="small text-muted fw-semibold" data-i18n="lbl_separator_model">Separator Model:</span>
+              <select id="separatorModelSelect" class="form-select form-select-sm" style="width: auto; max-width: 200px;">
+                <!-- Dynamic options populated from models.json -->
+                <option value="dsp">DSP Crossover Filter (CPU)</option>
+                <option value="custom">Load Custom Local ONNX Model...</option>
+              </select>
+              <input type="file" id="customModelUpload" accept=".onnx" class="d-none">
+            </div>
+
+            <!-- Scan Speed Options -->
+            <div class="d-flex align-items-center gap-2">
+              <span class="small text-muted fw-semibold">Scan Speed:</span>
+              <div class="btn-group btn-group-sm" role="group" aria-label="Scan speed selection">
+                <input type="radio" class="btn-check" name="scanSpeed" id="speedNormal" value="normal" checked>
+                <label class="btn-outline-primary btn btn-sm py-1" for="speedNormal">Normal</label>
+                
+                <input type="radio" class="btn-check" name="scanSpeed" id="speedFast" value="fast">
+                <label class="btn-outline-primary btn btn-sm py-1" for="speedFast">Fast (10x)</label>
+                
+                <input type="radio" class="btn-check" name="scanSpeed" id="speedTurbo" value="turbo">
+                <label class="btn-outline-primary btn btn-sm py-1" for="speedTurbo">Turbo</label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Progress Bar -->
+          <div class="mt-4">
+            <div class="d-flex justify-content-between align-items-center mb-1">
+              <span id="scanStatusText" class="small fw-semibold text-muted">Awaiting scan...</span>
+              <span id="scanProgressText" class="small fw-semibold text-muted">0%</span>
+            </div>
+            <div class="progress" style="height: 8px;">
+              <div id="scanProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-success" role="progressbar" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Advanced Developer Settings (Mirroring drawer settings) -->
+      <div class="card border-0 shadow-sm mb-4 rounded-3 overflow-hidden">
+        <div class="card-header bg-light border-0 py-3 d-flex justify-content-between align-items-center" style="cursor: pointer;" data-bs-toggle="collapse" data-bs-target="#advancedDevSettings" aria-expanded="false" aria-controls="advancedDevSettings">
+          <h6 class="m-0 fw-bold text-dark d-flex align-items-center gap-2">
+            <i class="bi bi-gear-fill text-primary"></i>
+            <span data-i18n="sec_advanced_developer">Advanced Developer Settings</span>
+          </h6>
+          <i class="bi bi-chevron-down"></i>
+        </div>
+        <div id="advancedDevSettings" class="collapse">
+          <div class="card-body p-4">
+            <div class="row g-3">
+              <!-- AAD Gate Switch -->
+              <div class="col-md-6">
+                <div class="form-check form-switch mb-3">
+                  <input class="form-check-input" type="checkbox" id="aadGateToggle" checked>
+                  <label class="form-check-label fw-semibold small" for="aadGateToggle" data-i18n="lbl_aad_gate">Acoustic Activity Gate (AAD)</label>
+                  <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_aad_gate_hint">Bypasses Pipeline B on quiet/low-frequency chunks.</div>
+                </div>
+                
+                <!-- AAD RMS Threshold Slider -->
+                <div class="mb-3" id="aadRmsContainer">
+                  <div class="d-flex justify-content-between">
+                    <label for="aadRmsRange" class="form-label small" data-i18n="lbl_aad_threshold">AAD RMS Threshold</label>
+                    <span class="small text-muted"><span id="aadRmsValue">0.010</span></span>
+                  </div>
+                  <input type="range" class="form-range" id="aadRmsRange" min="0.001" max="0.100" step="0.001" value="0.010">
+                </div>
+
+                <!-- AAD Centroid Min Slider -->
+                <div class="mb-3" id="aadCentroidContainer">
+                  <div class="d-flex justify-content-between">
+                    <label for="aadCentroidRange" class="form-label small" data-i18n="lbl_aad_centroid_min">AAD Centroid Min (Hz)</label>
+                    <span class="small text-muted"><span id="aadCentroidValue">1000 Hz</span></span>
+                  </div>
+                  <input type="range" class="form-range" id="aadCentroidRange" min="200" max="4000" step="100" value="1000">
+                </div>
+              </div>
+
+              <!-- Early Exit & Hardware -->
+              <div class="col-md-6">
+                <div class="form-check form-switch mb-3">
+                  <input class="form-check-input" type="checkbox" id="earlyExitToggle" checked>
+                  <label class="form-check-label fw-semibold small" for="earlyExitToggle" data-i18n="lbl_early_exit">Early Exit Threshold</label>
+                  <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_early_exit_hint">Bypasses separation if raw mix confidence (A) is high.</div>
+                </div>
+
+                <div class="mb-3" id="earlyExitConfidenceContainer">
+                  <div class="d-flex justify-content-between">
+                    <label for="earlyExitConfidenceRange" class="form-label small" data-i18n="lbl_threshold">Early Exit Confidence</label>
+                    <span class="small text-muted"><span id="earlyExitConfidenceValue">90%</span></span>
+                  </div>
+                  <input type="range" class="form-range" id="earlyExitConfidenceRange" min="50" max="100" step="5" value="90">
+                </div>
+
+                <hr class="my-3 opacity-25 d-md-none">
+
+                <!-- Hardware Acceleration & Precision -->
+                <div class="form-check form-switch mb-3">
+                  <input class="form-check-input" type="checkbox" id="webgpuToggle" checked>
+                  <label class="form-check-label fw-semibold small" for="webgpuToggle" data-i18n="lbl_hardware_webgpu">Use WebGPU Acceleration</label>
+                </div>
+
+                <div class="mb-0">
+                  <label for="separatorPrecisionSelect" class="form-label small" data-i18n="lbl_separator_precision">Model Precision</label>
+                  <select id="separatorPrecisionSelect" class="form-select form-select-sm">
+                    <option value="fp32">FP32 (Full Precision)</option>
+                    <option value="fp16">FP16 (Half Precision)</option>
+                    <option value="int8">INT8 (Quantized)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Stride and Window settings -->
+            <div class="row g-3 mt-2 border-top pt-3">
+              <div class="col-md-6">
+                <div class="d-flex justify-content-between">
+                  <label for="pipelineBWindowRange" class="form-label small" data-i18n="lbl_analysis_window">Analysis Window</label>
+                  <span class="small text-muted"><span id="pipelineBWindowValue">9.0s</span></span>
+                </div>
+                <input type="range" class="form-range" id="pipelineBWindowRange" min="3.0" max="9.0" step="0.5" value="9.0">
+              </div>
+              <div class="col-md-6">
+                <div class="d-flex justify-content-between">
+                  <label for="pipelineBStrideRange" class="form-label small" data-i18n="lbl_step_stride">Step Stride</label>
+                  <span class="small text-muted"><span id="pipelineBStrideValue">4.5s</span></span>
+                </div>
+                <input type="range" class="form-range" id="pipelineBStrideRange" min="0.5" max="4.5" step="0.5" value="4.5">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detections Timeline Listing -->
+      <h5 class="fw-bold text-primary mb-3"><i class="bi bi-card-list me-2"></i>Analysis Results</h5>
+      <div id="uploadDetectionsList" class="row g-3">
+        <div class="col-12 text-center text-muted py-5 card border-0 shadow-sm rounded-3">
+          <div class="card-body">
+            <i class="bi bi-soundwave fs-1 d-block mb-3 opacity-25"></i>
+            <p>Upload a file and start scanning to extract species detections.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Live Debug & Logs Console -->
+    <div class="col-lg-4">
+      <div class="card border-0 shadow-sm h-100 rounded-3 overflow-hidden d-flex flex-column" style="min-height: 450px;">
+        <div class="card-header bg-primary text-white py-3">
+          <h6 class="m-0 fw-bold d-flex align-items-center gap-2">
+            <i class="bi bi-terminal-fill"></i>Consensus Debug Console
+          </h6>
+        </div>
+        <div class="card-body bg-dark text-light p-3 font-monospace flex-grow-1 overflow-auto d-flex flex-column-reverse" id="debugLogConsole" style="font-size: 0.8rem; line-height: 1.4;">
+          <!-- Console Logs will append here (flex-column-reverse appends logs at bottom) -->
+          <div><span class="text-success">[System]</span> Ready for file upload. awaiting input...</div>
+        </div>
+        <div class="card-footer bg-dark border-0 p-2 text-end">
+          <button class="btn btn-xs btn-outline-secondary py-1 px-2 font-monospace" style="font-size: 0.7rem;" onclick="document.getElementById('debugLogConsole').firstElementChild.innerHTML = '<div><span class=\'text-success\'>[System]</span> Console cleared. awaiting scan...</div>'">
+            <i class="bi bi-trash3 me-1"></i>Clear
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="{{ '/js/upload.js' | url }}"></script>

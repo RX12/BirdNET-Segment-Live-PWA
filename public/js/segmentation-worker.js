@@ -17,6 +17,9 @@ const WASM_PATH = prefix + 'tflite-wasm/';
 const ORT_PATH = prefix + 'js/ort.min.js';
 const ORT_WASM_PATH = prefix + 'onnx-wasm/';
 
+const runOnGPU = params.get('runOnGPU') !== 'false';
+let currentOutputSampleRate = parseInt(params.get('outputSampleRate') || '48000', 10);
+
 importScripts(TF_PATH);
 importScripts(TFLITE_PATH);
 importScripts(ORT_PATH);
@@ -60,15 +63,31 @@ class ONNXAudioSeparator extends AudioSeparator {
     async loadModel() {
         try {
             console.log(`[ONNXAudioSeparator] Loading model from ${this.modelPath}...`);
-            // Attempt to load using WebGPU first, falling back to WebAssembly
+            // Attempt to load using WebGPU first (if enabled), falling back to WebAssembly
+            const providers = runOnGPU ? ['webgpu', 'wasm'] : ['wasm'];
             this.session = await ort.InferenceSession.create(this.modelPath, {
-                executionProviders: ['webgpu', 'wasm']
+                executionProviders: providers
             });
             console.log(`[ONNXAudioSeparator] Model loaded successfully on provider: ${this.session.handler.provider || 'default'}`);
         } catch (err) {
             console.warn(`[ONNXAudioSeparator] Failed to load ONNX model. Dynamic DSP fallback will be used instead. Error:`, err);
             this.hasFailedToLoad = true;
             this.session = null;
+        }
+    }
+
+    async loadModelFromBytes(modelBytes) {
+        try {
+            console.log(`[ONNXAudioSeparator] Loading model from custom bytes (${(modelBytes.byteLength / 1024 / 1024).toFixed(2)} MB)...`);
+            this.session = await ort.InferenceSession.create(modelBytes, {
+                executionProviders: ['webgpu', 'wasm']
+            });
+            console.log(`[ONNXAudioSeparator] Custom model loaded successfully on provider: ${this.session.handler.provider || 'default'}`);
+        } catch (err) {
+            console.error(`[ONNXAudioSeparator] Failed to load custom ONNX model from bytes:`, err);
+            this.hasFailedToLoad = true;
+            this.session = null;
+            throw err;
         }
     }
 
@@ -85,10 +104,36 @@ class ONNXAudioSeparator extends AudioSeparator {
             
             const outputNames = Object.keys(results);
             const tracks = [];
-            for (const name of outputNames) {
+
+            // If there is only a single output tensor, check if it contains multiple channels (e.g., Demucs shape [1, 2, samples])
+            if (outputNames.length === 1) {
+                const name = outputNames[0];
                 const tensor = results[name];
                 if (tensor && tensor.data instanceof Float32Array) {
-                    tracks.push(tensor.data);
+                    const dims = tensor.dims;
+                    if (dims && dims.length >= 2) {
+                        const numChannels = dims[dims.length - 2];
+                        const sampleLength = dims[dims.length - 1];
+                        if (numChannels > 1 && numChannels < 10 && numChannels * sampleLength === tensor.data.length) {
+                            console.log(`[ONNXAudioSeparator] Single output tensor detected with ${numChannels} channels of length ${sampleLength}. Splitting...`);
+                            for (let c = 0; c < numChannels; c++) {
+                                const start = c * sampleLength;
+                                const end = start + sampleLength;
+                                // Create a sliced view or copy
+                                tracks.push(new Float32Array(tensor.data.subarray(start, end)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback to reading separate output nodes (if the single tensor split wasn't applicable)
+            if (tracks.length === 0) {
+                for (const name of outputNames) {
+                    const tensor = results[name];
+                    if (tensor && tensor.data instanceof Float32Array) {
+                        tracks.push(tensor.data);
+                    }
                 }
             }
 
@@ -167,8 +212,21 @@ async function init() {
         await loadLabels();
 
         // 2. Load Separator Model
-        separatorModel = new ONNXAudioSeparator(SEPARATOR_MODEL_PATH);
-        await separatorModel.loadModel();
+        const separator = params.get('separator') || 'biocppnet';
+        const modelPath = params.get('modelPath') || '';
+
+        if (separator === 'dsp') {
+            console.log("[Segmentation Worker] Configured to use DSP crossover filter directly.");
+            separatorModel = new ONNXAudioSeparator("");
+            separatorModel.hasFailedToLoad = true;
+        } else if (separator === 'custom') {
+            console.log("[Segmentation Worker] Awaiting custom model bytes from main thread...");
+            // Custom model loader will instantiate separatorModel and set isReady when bytes arrive
+        } else {
+            const separatorModelPath = modelPath || (prefix + 'models/biocppnet.onnx');
+            separatorModel = new ONNXAudioSeparator(separatorModelPath);
+            await separatorModel.loadModel();
+        }
 
         // 3. Load TFLite Classification Model
         console.log("[Segmentation Worker] Loading BirdNET FP32 model...");
@@ -187,8 +245,11 @@ async function init() {
             throw warmupErr;
         }
 
-        isReady = true;
-        console.log("[Segmentation Worker] Initialization complete and ready.");
+        // If we are not waiting for custom model bytes, we are ready!
+        if (separator !== 'custom') {
+            isReady = true;
+            console.log("[Segmentation Worker] Initialization complete and ready.");
+        }
     } catch (err) {
         console.error("[Segmentation Worker] Initialization failed:", err);
     }
@@ -233,12 +294,54 @@ async function loadLabels() {
     }
 }
 
+function upsampleLinear(sourceBuffer, targetBuffer, sourceFs, targetFs) {
+    const sourceLength = sourceBuffer.length;
+    const targetLength = targetBuffer.length;
+    const ratio = (sourceLength - 1) / (targetLength - 1);
+
+    for (let i = 0; i < targetLength; i++) {
+        const srcIndex = i * ratio;
+        const baseIndex = Math.floor(srcIndex);
+        const fraction = srcIndex - baseIndex;
+
+        if (baseIndex + 1 < sourceLength) {
+            targetBuffer[i] = sourceBuffer[baseIndex] * (1 - fraction) + sourceBuffer[baseIndex + 1] * fraction;
+        } else {
+            targetBuffer[i] = sourceBuffer[baseIndex];
+        }
+    }
+}
+
 /* ==========================================================================
    5. MESSAGE HANDLING & PROCESS SEGMENT
    ========================================================================== */
 
 self.onmessage = async (event) => {
     const { type, payload } = event.data || {};
+
+    if (type === "UPDATE_CONFIG") {
+        const { outputSampleRate } = payload || {};
+        if (outputSampleRate !== undefined) {
+            currentOutputSampleRate = outputSampleRate;
+            console.log(`[Segmentation Worker] Runtime config updated: currentOutputSampleRate = ${currentOutputSampleRate}`);
+        }
+        return;
+    }
+
+    if (type === "SET_MODEL_BYTES") {
+        const { modelBytes } = payload;
+        if (modelBytes) {
+            try {
+                separatorModel = new ONNXAudioSeparator("");
+                await separatorModel.loadModelFromBytes(modelBytes);
+                isReady = true;
+                console.log("[Segmentation Worker] Custom local model bytes loaded successfully. Worker ready.");
+            } catch (err) {
+                console.error("[Segmentation Worker] Failed to load custom local model bytes:", err);
+            }
+        }
+        return;
+    }
     
     if (type === "PROCESS_SEGMENT") {
         const { segmentId, timestamp, sampleRate, audioBuffer, meta } = payload;
@@ -270,7 +373,19 @@ self.onmessage = async (event) => {
             // Step 2: Classify each separated track
             for (let tIdx = 0; tIdx < isolatedTracks.length; tIdx++) {
                 const track = isolatedTracks[tIdx];
-                const trackLen = track.length;
+                
+                // Resample track from model native rate to 48000Hz if needed
+                let processedTrack = track;
+                const modelSR = currentOutputSampleRate || SAMPLE_RATE;
+                if (modelSR !== SAMPLE_RATE) {
+                    const targetLen = Math.round(track.length * (SAMPLE_RATE / modelSR));
+                    const resampled = new Float32Array(targetLen);
+                    upsampleLinear(track, resampled, modelSR, SAMPLE_RATE);
+                    processedTrack = resampled;
+                    console.log(`[Segmentation Worker] Resampled track from ${modelSR}Hz (${track.length} samples) to ${SAMPLE_RATE}Hz (${targetLen} samples).`);
+                }
+                
+                const trackLen = processedTrack.length;
 
                 // Frame the track audio into 3-second slices with 1.5s hop size
                 const numFrames = Math.max(1, Math.ceil(Math.max(0, trackLen - WINDOW_SAMPLES) / HOP_SAMPLES) + 1);
@@ -278,7 +393,7 @@ self.onmessage = async (event) => {
                 for (let f = 0; f < numFrames; f++) {
                     const start = f * HOP_SAMPLES;
                     const srcEnd = Math.min(start + WINDOW_SAMPLES, trackLen);
-                    framed.set(track.subarray(start, srcEnd), f * WINDOW_SAMPLES);
+                    framed.set(processedTrack.subarray(start, srcEnd), f * WINDOW_SAMPLES);
                 }
 
                 // Run inference frame by frame
@@ -319,7 +434,7 @@ self.onmessage = async (event) => {
                 results.push({
                     channelId: tIdx,
                     label: `separated_channel_${tIdx}`,
-                    audioBuffer: track,
+                    audioBuffer: processedTrack,
                     predictions: formattedPredictions
                 });
             }

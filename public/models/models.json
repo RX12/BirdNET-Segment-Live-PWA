@@ -1,0 +1,23 @@
+[
+  {
+    "id": "bird_mixit_4source",
+    "name": "Bird-MixIT 4-Source (ONNX)",
+    "path": "models/bird_mixit_4source.onnx",
+    "outputSampleRate": 22050,
+    "precisions": {
+      "fp32": "models/bird_mixit_4source.onnx",
+      "fp16": "models/bird_mixit_4source_fp16.onnx",
+      "int8": "models/bird_mixit_4source_int8.onnx"
+    }
+  },
+  {
+    "id": "mel_band_roformer",
+    "name": "Mel-Band Roformer (UVR)",
+    "path": "models/mel_band_roformer.onnx",
+    "outputSampleRate": 44100,
+    "precisions": {
+      "fp32": "models/mel_band_roformer.onnx",
+      "fp16": "models/mel_band_roformer_fp16.onnx"
+    }
+  }
+]

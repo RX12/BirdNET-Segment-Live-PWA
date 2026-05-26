@@ -29,6 +29,7 @@ const CORE_URLS = [
   "about/",
   "legal/",
   "share/",
+  "upload/",
   "favicon.png",
   "manifest.webmanifest",
   "img/birdnet-logo-circle.png",
@@ -45,6 +46,7 @@ const CORE_URLS = [
   "js/audio-router.js",
   "js/live-worker.js",
   "js/segmentation-worker.js",
+  "js/upload.js",
   "js/tfjs-4.14.0.min.js",
   "js/tf-tflite.min.js",
   "js/ort.min.js",
@@ -55,7 +57,8 @@ const CORE_URLS = [
   "locales/es.json",
   "locales/pt.json",
   "locales/nl.json",
-  "locales/ru.json"
+  "locales/ru.json",
+  "models/models.json"
 ];
 
 // Model Files & Labels (Large, rarely changed)
@@ -201,7 +204,7 @@ self.addEventListener("fetch", (event) => {
     : url.pathname.replace(/^\/+/, "");
 
   // B. Model Files -> Cache First
-  if (MODEL_URLS.includes(rel)) {
+  if (MODEL_URLS.includes(rel) || (rel.startsWith("models/") && (rel.endsWith(".onnx") || rel.endsWith(".tflite")))) {
     event.respondWith(handleCacheFirst(request, MODEL_CACHE_NAME, rel));
     return;
   }

@@ -86,6 +86,16 @@ class AudioRouter {
         this.getSensitivity = options.getSensitivity || (() => 1.0);
         this.getGeoContext = options.getGeoContext || (() => ({}));
         this.onInferenceStart = options.onInferenceStart || (() => {});
+        this.getBConfig = options.getBConfig || (() => ({
+            windowSize: 9.0,
+            stride: 4.5,
+            gateEnabled: true,
+            rmsThreshold: 0.01,
+            centroidMin: 1000,
+            earlyExitEnabled: true,
+            earlyExitConfidence: 0.90
+        }));
+        this.maxConfidenceInInterval = 0;
     }
 
     /**
@@ -97,12 +107,118 @@ class AudioRouter {
     }
 
     /**
+     * Calculate Root Mean Square (RMS) of audio samples.
+     */
+    calculateRMS(samples) {
+        let sum = 0;
+        const len = samples.length;
+        for (let i = 0; i < len; i++) {
+            sum += samples[i] * samples[i];
+        }
+        return Math.sqrt(sum / len);
+    }
+
+    /**
+     * Zero-crossing frequency surrogate of Spectral Centroid.
+     */
+    calculateSpectralCentroid(samples, sampleRate) {
+        let crossings = 0;
+        const len = samples.length;
+        if (len <= 1) return 0;
+        for (let i = 1; i < len; i++) {
+            if ((samples[i] >= 0 && samples[i-1] < 0) || (samples[i] < 0 && samples[i-1] >= 0)) {
+                crossings++;
+            }
+        }
+        const duration = len / sampleRate;
+        return crossings / (2 * duration);
+    }
+
+    /**
+     * Set/update max confidence from live classifier to evaluate early exit.
+     */
+    reportLiveConfidence(confidence) {
+        this.maxConfidenceInInterval = Math.max(this.maxConfidenceInInterval, confidence);
+    }
+
+    /**
+     * Recreate Pipeline B setInterval loops dynamically.
+     */
+    updatePipelineBInterval() {
+        if (!this.isRouting) return;
+
+        if (this.intervalBId) {
+            clearInterval(this.intervalBId);
+            this.intervalBId = null;
+        }
+
+        const bConfig = this.getBConfig();
+        const strideMs = bConfig.stride * 1000;
+        const segmentedWindowSamples = this.sampleRate * bConfig.windowSize;
+
+        console.log(`[AudioRouter] Recreating Pipeline B interval: every ${strideMs}ms with window size ${bConfig.windowSize}s (${segmentedWindowSamples} samples)`);
+
+        this.intervalBId = setInterval(() => {
+            if (!this.isRouting || !this.segmentationWorker) return;
+
+            // MOBILE FIX: Skip dispatch if the worker is still processing the previous segment
+            if (this.segmentBusy) {
+                console.log("[AudioRouter] Pipeline B busy, skipping segment dispatch.");
+                return;
+            }
+
+            // Require at least windowSize seconds of audio to start segmentation
+            if (this.ringBuffer.getSamplesWritten() < segmentedWindowSamples) return;
+
+            const pcm = this.ringBuffer.readLast(segmentedWindowSamples);
+
+            // AAD Gate Check
+            if (bConfig.gateEnabled) {
+                const rms = this.calculateRMS(pcm);
+                const centroid = this.calculateSpectralCentroid(pcm, this.sampleRate);
+                
+                if (rms < bConfig.rmsThreshold || centroid < bConfig.centroidMin) {
+                    console.log(`[AudioRouter] Pipeline B: Bypassed via gate (rms: ${rms.toFixed(4)} < ${bConfig.rmsThreshold} OR centroid: ${Math.round(centroid)}Hz < ${bConfig.centroidMin}Hz)`);
+                    return;
+                }
+            }
+
+            // Early Exit Check
+            if (bConfig.earlyExitEnabled && this.maxConfidenceInInterval >= bConfig.earlyExitConfidence) {
+                console.log(`[AudioRouter] Pipeline B: Bypassed via early exit (max live confidence: ${(this.maxConfidenceInInterval * 100).toFixed(1)}% >= ${(bConfig.earlyExitConfidence * 100).toFixed(0)}%)`);
+                this.maxConfidenceInInterval = 0; // reset for next interval
+                return;
+            }
+            this.maxConfidenceInInterval = 0; // reset for next interval
+
+            const segmentId = `seg-${Date.now()}-${this.segmentCounter++}`;
+            const geoCtx = this.getGeoContext();
+
+            console.log(`[AudioRouter] Dispatching segment ${segmentId} to Pipeline B...`);
+            this.segmentBusy = true;
+            
+            this.segmentationWorker.postMessage({
+                type: "PROCESS_SEGMENT",
+                payload: {
+                    segmentId: segmentId,
+                    timestamp: Date.now(),
+                    sampleRate: this.sampleRate,
+                    audioBuffer: pcm,
+                    meta: geoCtx
+                }
+            }, [pcm.buffer]);
+
+        }, strideMs);
+    }
+
+    /**
      * Start the dual-dispatch interval loops.
      */
     start() {
         if (this.isRouting) return;
         this.isRouting = true;
         this.segmentCounter = 0;
+        this.maxConfidenceInInterval = 0;
 
         console.log("[AudioRouter] Starting dual-routing loops...");
 
@@ -129,40 +245,8 @@ class AudioRouter {
             
         }, 1000);
 
-        // Pipeline B (Segmented): Sends last 9 seconds of audio every 4.5 seconds
-        const segmentedWindowSamples = this.sampleRate * 9;
-        this.intervalBId = setInterval(() => {
-            if (!this.isRouting || !this.segmentationWorker) return;
-
-            // MOBILE FIX: Skip dispatch if the worker is still processing
-            // the previous segment (backpressure).
-            if (this.segmentBusy) {
-                console.log("[AudioRouter] Pipeline B busy, skipping segment dispatch.");
-                return;
-            }
-
-            // Require at least 9 seconds of audio to start segmentation
-            if (this.ringBuffer.getSamplesWritten() < segmentedWindowSamples) return;
-
-            const pcm = this.ringBuffer.readLast(segmentedWindowSamples);
-            const segmentId = `seg-${Date.now()}-${this.segmentCounter++}`;
-            const geoCtx = this.getGeoContext();
-
-            console.log(`[AudioRouter] Dispatching segment ${segmentId} to Pipeline B...`);
-            this.segmentBusy = true;
-            
-            this.segmentationWorker.postMessage({
-                type: "PROCESS_SEGMENT",
-                payload: {
-                    segmentId: segmentId,
-                    timestamp: Date.now(),
-                    sampleRate: this.sampleRate,
-                    audioBuffer: pcm,
-                    meta: geoCtx
-                }
-            }, [pcm.buffer]);
-
-        }, 4500);
+        // Start Pipeline B dispatch loop
+        this.updatePipelineBInterval();
     }
 
     /**

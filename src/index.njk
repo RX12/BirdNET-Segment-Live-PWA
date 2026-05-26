@@ -83,6 +83,16 @@ permalink: "/"
         <label for="labelLangSelect" class="form-label" data-i18n="lbl_label_lang">Label language</label>
         <select id="labelLangSelect" class="form-select"></select>
       </div>
+
+      <div class="col-12">
+        <label for="separatorModelSelect" class="form-label" data-i18n="lbl_separator_model">Separator Model (Pipeline B)</label>
+        <select id="separatorModelSelect" class="form-select">
+          <!-- Dynamic options populated from models.json -->
+          <option value="dsp">DSP Crossover Filter (CPU)</option>
+          <option value="custom">Load Custom Local ONNX Model...</option>
+        </select>
+        <input type="file" id="customModelUpload" accept=".onnx" class="d-none">
+      </div>
       
       <!-- Threshold -->
       <div class="col-12">
@@ -133,6 +143,99 @@ permalink: "/"
         </div>
         <input type="range" class="form-range" id="rumbleFilterRange" min="0" max="1000" step="50">
         <div class="form-text small" data-i18n="msg_rumble_hint">Removes wind and traffic noise below this frequency.</div>
+      </div>
+
+      <!-- Advanced Developer Settings Collapse -->
+      <div class="col-12 mt-3">
+        <div class="card border-1 bg-light">
+          <div class="card-header border-0 bg-transparent py-2 d-flex justify-content-between align-items-center" style="cursor: pointer;" data-bs-toggle="collapse" data-bs-target="#advancedDevSettings" aria-expanded="false" aria-controls="advancedDevSettings">
+            <span class="fw-bold text-dark small" data-i18n="sec_advanced_developer">Advanced Developer Settings</span>
+            <i class="bi bi-chevron-down"></i>
+          </div>
+          <div id="advancedDevSettings" class="collapse">
+            <div class="card-body pt-0 pb-3">
+              <!-- AAD Gate Switch -->
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="aadGateToggle" checked>
+                <label class="form-check-label fw-semibold small" for="aadGateToggle" data-i18n="lbl_aad_gate">Acoustic Activity Gate (AAD)</label>
+                <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_aad_gate_hint">Bypasses Pipeline B on quiet/low-frequency chunks.</div>
+              </div>
+              
+              <!-- AAD RMS Threshold Slider -->
+              <div class="mb-3" id="aadRmsContainer">
+                <div class="d-flex justify-content-between">
+                  <label for="aadRmsRange" class="form-label small" data-i18n="lbl_aad_threshold">AAD RMS Threshold</label>
+                  <span class="small text-muted"><span id="aadRmsValue">0.010</span></span>
+                </div>
+                <input type="range" class="form-range" id="aadRmsRange" min="0.001" max="0.100" step="0.001" value="0.010">
+              </div>
+
+              <!-- AAD Centroid Min Slider -->
+              <div class="mb-3" id="aadCentroidContainer">
+                <div class="d-flex justify-content-between">
+                  <label for="aadCentroidRange" class="form-label small" data-i18n="lbl_aad_centroid_min">AAD Centroid Min (Hz)</label>
+                  <span class="small text-muted"><span id="aadCentroidValue">1000 Hz</span></span>
+                </div>
+                <input type="range" class="form-range" id="aadCentroidRange" min="200" max="4000" step="100" value="1000">
+              </div>
+
+              <hr class="my-3 opacity-25">
+
+              <!-- Early Exit Switch & Confidence -->
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="earlyExitToggle" checked>
+                <label class="form-check-label fw-semibold small" for="earlyExitToggle" data-i18n="lbl_early_exit">Early Exit Threshold</label>
+                <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_early_exit_hint">Bypasses separation if raw mix confidence (A) is high.</div>
+              </div>
+
+              <div class="mb-3" id="earlyExitConfidenceContainer">
+                <div class="d-flex justify-content-between">
+                  <label for="earlyExitConfidenceRange" class="form-label small" data-i18n="lbl_threshold">Early Exit Confidence</label>
+                  <span class="small text-muted"><span id="earlyExitConfidenceValue">90%</span></span>
+                </div>
+                <input type="range" class="form-range" id="earlyExitConfidenceRange" min="50" max="100" step="5" value="90">
+              </div>
+
+              <hr class="my-3 opacity-25">
+
+              <!-- Timing & Stride Window Size -->
+              <div class="mb-3">
+                <div class="d-flex justify-content-between">
+                  <label for="pipelineBWindowRange" class="form-label small" data-i18n="lbl_analysis_window">Analysis Window</label>
+                  <span class="small text-muted"><span id="pipelineBWindowValue">9.0s</span></span>
+                </div>
+                <input type="range" class="form-range" id="pipelineBWindowRange" min="3.0" max="9.0" step="0.5" value="9.0">
+                <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_analysis_window_hint">Window size.</div>
+              </div>
+
+              <div class="mb-3">
+                <div class="d-flex justify-content-between">
+                  <label for="pipelineBStrideRange" class="form-label small" data-i18n="lbl_step_stride">Step Stride</label>
+                  <span class="small text-muted"><span id="pipelineBStrideValue">4.5s</span></span>
+                </div>
+                <input type="range" class="form-range" id="pipelineBStrideRange" min="0.5" max="4.5" step="0.5" value="4.5">
+                <div class="form-text small" style="font-size: 0.75rem;" data-i18n="msg_step_stride_hint">Stride.</div>
+              </div>
+
+              <hr class="my-3 opacity-25">
+
+              <!-- Hardware Acceleration & Precision -->
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="webgpuToggle" checked>
+                <label class="form-check-label fw-semibold small" for="webgpuToggle" data-i18n="lbl_hardware_webgpu">Use WebGPU Acceleration</label>
+              </div>
+
+              <div class="mb-0">
+                <label for="separatorPrecisionSelect" class="form-label small" data-i18n="lbl_separator_precision">Model Precision</label>
+                <select id="separatorPrecisionSelect" class="form-select form-select-sm">
+                  <option value="fp32">FP32 (Full Precision)</option>
+                  <option value="fp16">FP16 (Half Precision)</option>
+                  <option value="int8">INT8 (Quantized)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 

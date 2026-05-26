@@ -236,6 +236,23 @@ let inferenceInterval = store.getFloat("bn_inference_interval", 500);
 let rumbleFilterFreq = store.getFloat("bn_rumble_freq", 200);
 let geoThreshold = store.getFloat("bn_geo_threshold", 0.05);
 
+// New Pipeline B configs:
+let aadEnabled = store.getBool("bn_aad_enabled", true);
+let aadRmsThreshold = store.getFloat("bn_aad_rms_threshold", 0.010);
+let aadCentroidMin = store.getFloat("bn_aad_centroid_min", 1000);
+let earlyExitEnabled = store.getBool("bn_early_exit_enabled", true);
+let earlyExitConfidence = store.getFloat("bn_early_exit_confidence", 0.90);
+let pipelineBWindow = store.getFloat("bn_pipeline_b_window", 9.0);
+let pipelineBStride = store.getFloat("bn_pipeline_b_stride", 4.5);
+let separatorPrecision = store.get("bn_separator_precision", "fp32");
+let webgpuEnabled = store.getBool("bn_webgpu_enabled", true);
+
+// Separator Model State
+let separatorModelCatalog = []; // Loaded from models.json
+let selectedSeparatorModel = store.get("bn_separator_model", "bird_mixit_4source");
+let customModelBytes = null;
+let customModelName = store.get("bn_custom_model_name", "");
+
 /* ==========================================================================
    5. DOM ACCESSORS
    ========================================================================== */
@@ -276,9 +293,26 @@ document.addEventListener("DOMContentLoaded", () => {
   // Only run if we are on Live or Explore pages
   if (!isLive && !isExplore) return;
 
-  initWorker(); 
   setupSettingsToggle();
   initUIControls();
+
+  // Load separator models catalog
+  const prefix = (window.PATH_PREFIX || "/");
+  fetch(prefix + "models/models.json")
+    .then(r => r.json())
+    .then(catalog => {
+      separatorModelCatalog = catalog;
+      initWorker();
+      populateSeparatorDropdowns();
+    })
+    .catch(err => {
+      console.warn("[App] Failed to load separator models catalog models.json, using fallback presets.", err);
+      separatorModelCatalog = [
+        { "id": "bird_mixit_4source", "name": "Bird-MixIT 4-Source (ONNX)", "path": "models/bird_mixit_4source.onnx" }
+      ];
+      initWorker();
+      populateSeparatorDropdowns();
+    });
 
   if (isLive) {
     setupRecordButton();
@@ -332,13 +366,55 @@ function initWorker(langOverride) {
   const tfPath = prefix + "js/tfjs-4.14.0.min.js";
   const root   = prefix + "models";
   const lang   = langOverride || currentLabelLang || (navigator.language || "en-US");
-  const params = new URLSearchParams({ tf: tfPath, root, lang, prefix });
+
+  // Determine separator parameters
+  let sepParam = selectedSeparatorModel;
+  let modelPath = "";
+  let modelSR = 48000;
+  if (selectedSeparatorModel !== "dsp" && selectedSeparatorModel !== "custom") {
+    const model = separatorModelCatalog.find(m => m.id === selectedSeparatorModel);
+    if (model) {
+      modelSR = model.outputSampleRate || 48000;
+      const precPath = model.precisions ? model.precisions[separatorPrecision] : null;
+      modelPath = prefix + (precPath || model.path);
+    } else {
+      modelPath = prefix + "models/bird_mixit_4source.onnx"; // fallback
+      modelSR = 22050;
+    }
+  }
+
+  const params = new URLSearchParams({ 
+    tf: tfPath, 
+    root, 
+    lang, 
+    prefix,
+    precision: separatorPrecision,
+    runOnGPU: webgpuEnabled ? "true" : "false",
+    outputSampleRate: modelSR.toString()
+  });
+  if (selectedSeparatorModel === "dsp") {
+    params.set("separator", "dsp");
+  } else if (selectedSeparatorModel === "custom") {
+    params.set("separator", "custom");
+  } else {
+    params.set("separator", selectedSeparatorModel);
+    params.set("modelPath", modelPath);
+  }
   
   const status = statusEl();
   if (status) updateStatus("status_loading_percent", 0);
   
   liveWorker = new Worker(prefix + "js/live-worker.js?" + params.toString());
   segmentationWorker = new Worker(prefix + "js/segmentation-worker.js?" + params.toString());
+
+  if (selectedSeparatorModel === "custom" && customModelBytes) {
+    segmentationWorker.postMessage({
+      type: "SET_MODEL_BYTES",
+      payload: {
+        modelBytes: customModelBytes.slice(0)
+      }
+    }, [customModelBytes.slice(0)]);
+  }
 
   liveWorker.onmessage = (event) => {
     const data = event.data || {};
@@ -383,14 +459,21 @@ function initWorker(langOverride) {
           : data.pooled;
 
         if (Array.isArray(toRender)) {
+          let maxConf = 0;
           const now = Date.now();
           toRender.forEach(p => {
+            if (p.confidence > maxConf) {
+              maxConf = p.confidence;
+            }
             if (p.confidence >= detectionThreshold && p.scientificName) {
               if (!verifiedDetections.has(p.scientificName) && !pendingDetections.has(p.scientificName)) {
                 pendingDetections.set(p.scientificName, now);
               }
             }
           });
+          if (audioRouter) {
+            audioRouter.reportLiveConfidence(maxConf);
+          }
         }
 
         renderDetections(toRender);
@@ -666,7 +749,16 @@ async function setupAudioGraphFromStream(stream, ctx) {
     },
     onInferenceStart: () => {
       lastInferenceStart = performance.now();
-    }
+    },
+    getBConfig: () => ({
+      windowSize: pipelineBWindow,
+      stride: pipelineBStride,
+      gateEnabled: aadEnabled,
+      rmsThreshold: aadRmsThreshold,
+      centroidMin: aadCentroidMin,
+      earlyExitEnabled: earlyExitEnabled,
+      earlyExitConfidence: earlyExitConfidence
+    })
   });
 
   // Use AudioWorklet for raw audio access (Replaces ScriptProcessor)
@@ -1081,6 +1173,85 @@ function initUIControls() {
       }
     });
   }
+
+  // AAD Gate Toggle
+  const aadGateToggle = document.getElementById("aadGateToggle");
+  if (aadGateToggle) {
+    aadGateToggle.checked = aadEnabled;
+    const updateContainers = () => {
+      const container1 = document.getElementById("aadRmsContainer");
+      const container2 = document.getElementById("aadCentroidContainer");
+      if (container1) container1.classList.toggle("d-none", !aadEnabled);
+      if (container2) container2.classList.toggle("d-none", !aadEnabled);
+    };
+    aadGateToggle.addEventListener("change", () => {
+      aadEnabled = aadGateToggle.checked;
+      store.set("bn_aad_enabled", aadEnabled);
+      updateContainers();
+    });
+    updateContainers();
+  }
+
+  // Early Exit Toggle
+  const earlyExitToggle = document.getElementById("earlyExitToggle");
+  if (earlyExitToggle) {
+    earlyExitToggle.checked = earlyExitEnabled;
+    const updateContainer = () => {
+      const container = document.getElementById("earlyExitConfidenceContainer");
+      if (container) container.classList.toggle("d-none", !earlyExitEnabled);
+    };
+    earlyExitToggle.addEventListener("change", () => {
+      earlyExitEnabled = earlyExitToggle.checked;
+      store.set("bn_early_exit_enabled", earlyExitEnabled);
+      updateContainer();
+    });
+    updateContainer();
+  }
+
+  // WebGPU Toggle
+  const webgpuToggle = document.getElementById("webgpuToggle");
+  if (webgpuToggle) {
+    webgpuToggle.checked = webgpuEnabled;
+    webgpuToggle.addEventListener("change", () => {
+      webgpuEnabled = webgpuToggle.checked;
+      store.set("bn_webgpu_enabled", webgpuEnabled);
+      initWorker();
+    });
+  }
+
+  // Separator Precision Select
+  const separatorPrecisionSelect = document.getElementById("separatorPrecisionSelect");
+  if (separatorPrecisionSelect) {
+    separatorPrecisionSelect.value = separatorPrecision;
+    separatorPrecisionSelect.addEventListener("change", () => {
+      separatorPrecision = separatorPrecisionSelect.value;
+      store.set("bn_separator_precision", separatorPrecision);
+      initWorker();
+    });
+  }
+
+  // Advanced Range Sliders
+  bindRange("aadRmsRange", aadRmsThreshold, (v) => {
+    aadRmsThreshold = v;
+  }, (v) => v.toFixed(3), "bn_aad_rms_threshold");
+
+  bindRange("aadCentroidRange", aadCentroidMin, (v) => {
+    aadCentroidMin = v;
+  }, (v) => `${Math.round(v)} Hz`, "bn_aad_centroid_min");
+
+  bindRange("earlyExitConfidenceRange", earlyExitConfidence * 100, (v) => {
+    earlyExitConfidence = v / 100;
+  }, (v) => `${Math.round(v)}%`, "bn_early_exit_confidence");
+
+  bindRange("pipelineBWindowRange", pipelineBWindow, (v) => {
+    pipelineBWindow = v;
+    if (audioRouter) audioRouter.updatePipelineBInterval();
+  }, (v) => `${v.toFixed(1)}s`, "bn_pipeline_b_window");
+
+  bindRange("pipelineBStrideRange", pipelineBStride, (v) => {
+    pipelineBStride = v;
+    if (audioRouter) audioRouter.updatePipelineBInterval();
+  }, (v) => `${v.toFixed(1)}s`, "bn_pipeline_b_stride");
 }
 
 function bindRange(id, initialValue, onChange, format, storageKey) {
@@ -1607,6 +1778,80 @@ function stopIsolatedAudio() {
   }
   currentlyPlayingSpecies = null;
   renderDetections();
+}
+
+function populateSeparatorDropdowns() {
+  const select = document.getElementById("separatorModelSelect");
+  if (!select) return;
+
+  select.innerHTML = "";
+
+  separatorModelCatalog.forEach(m => {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.name;
+    select.appendChild(opt);
+  });
+
+  const dspOpt = document.createElement("option");
+  dspOpt.value = "dsp";
+  dspOpt.textContent = "DSP Crossover Filter (CPU)";
+  select.appendChild(dspOpt);
+
+  const customOpt = document.createElement("option");
+  customOpt.value = "custom";
+  customOpt.textContent = customModelName ? `Custom: ${customModelName}` : "Load Custom Local ONNX Model...";
+  select.appendChild(customOpt);
+
+  select.value = selectedSeparatorModel;
+
+  select.addEventListener("change", () => {
+    const val = select.value;
+    if (val === "custom") {
+      const fileInput = document.getElementById("customModelUpload");
+      if (fileInput) {
+        fileInput.click();
+      }
+    } else {
+      selectedSeparatorModel = val;
+      store.set("bn_separator_model", selectedSeparatorModel);
+      customModelBytes = null;
+      customOpt.textContent = "Load Custom Local ONNX Model...";
+      initWorker();
+    }
+  });
+
+  const fileInput = document.getElementById("customModelUpload");
+  if (fileInput) {
+    const newInput = fileInput.cloneNode(true);
+    fileInput.parentNode.replaceChild(newInput, fileInput);
+
+    newInput.addEventListener("change", () => {
+      const files = newInput.files;
+      if (files && files.length > 0) {
+        const file = files[0];
+        customModelName = file.name;
+        store.set("bn_custom_model_name", customModelName);
+        customOpt.textContent = `Custom: ${customModelName}`;
+        
+        selectedSeparatorModel = "custom";
+        store.set("bn_separator_model", "custom");
+        select.value = "custom";
+
+        console.log(`[App] Loading custom local model: ${file.name}...`);
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          customModelBytes = e.target.result;
+          console.log("[App] Custom local model bytes loaded. Re-initializing workers...");
+          initWorker();
+        };
+        reader.readAsArrayBuffer(file);
+      } else {
+        select.value = selectedSeparatorModel;
+      }
+    });
+  }
 }
 
 window.playIsolatedAudio = playIsolatedAudio;
