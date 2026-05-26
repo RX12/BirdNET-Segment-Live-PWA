@@ -6,6 +6,16 @@ yarn.lock
 _site/
 dist/
 
+# Python virtual environments (never commit these — contain large binaries)
+venv/
+.venv/
+env/
+.env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Logs
 logs
 *.log
