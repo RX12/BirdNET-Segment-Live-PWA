@@ -62,6 +62,8 @@ let lastInferenceStart = 0;
 let lastInferenceMs = null;
 let recentInferenceSets = []; // Buffer for temporal pooling
 let latestDetections = [];
+let liveHistoryDetections = []; // Persistent chronological history of detections in live session
+let pendingRejections = new Map(); // Keep track of deferred rejection timeout IDs
 let verifiedDetections = new Map();
 let pendingDetections = new Map();
 let playbackAudioContext = null;
@@ -150,7 +152,7 @@ async function loadTranslations(lang) {
     updateUIText();
     
     // Re-render dynamic lists to apply new translations
-    renderDetections(latestDetections);
+    renderDetections();
     if (document.getElementById("exploreList")) renderExploreList();
 
     // Update selector if it exists
@@ -363,8 +365,6 @@ function initWorker(langOverride) {
   if (btn) btn.disabled = true;
   
   const prefix = (window.PATH_PREFIX || "/");
-  const tfPath = prefix + "js/tfjs-4.14.0.min.js";
-  const root   = prefix + "models";
   const lang   = langOverride || currentLabelLang || (navigator.language || "en-US");
 
   // Determine separator parameters
@@ -383,29 +383,29 @@ function initWorker(langOverride) {
     }
   }
 
-  const params = new URLSearchParams({ 
-    tf: tfPath, 
-    root, 
-    lang, 
-    prefix,
-    precision: separatorPrecision,
-    runOnGPU: webgpuEnabled ? "true" : "false",
-    outputSampleRate: modelSR.toString()
-  });
-  if (selectedSeparatorModel === "dsp") {
-    params.set("separator", "dsp");
-  } else if (selectedSeparatorModel === "custom") {
-    params.set("separator", "custom");
-  } else {
-    params.set("separator", selectedSeparatorModel);
-    params.set("modelPath", modelPath);
-  }
-  
   const status = statusEl();
   if (status) updateStatus("status_loading_percent", 0);
   
-  liveWorker = new Worker(prefix + "js/live-worker.js?" + params.toString());
-  segmentationWorker = new Worker(prefix + "js/segmentation-worker.js?" + params.toString());
+  liveWorker = new Worker(prefix + "js/live-worker.js");
+  segmentationWorker = new Worker(prefix + "js/segmentation-worker.js");
+
+  // Send initialization parameters via message passing
+  liveWorker.postMessage({
+    message: 'init',
+    lang: lang
+  });
+
+  segmentationWorker.postMessage({
+    type: 'INIT',
+    payload: {
+      separator: selectedSeparatorModel,
+      modelPath: modelPath,
+      runOnGPU: webgpuEnabled,
+      outputSampleRate: modelSR,
+      lang: lang,
+      pipelineBWindow: pipelineBWindow
+    }
+  });
 
   if (selectedSeparatorModel === "custom" && customModelBytes) {
     segmentationWorker.postMessage({
@@ -466,8 +466,41 @@ function initWorker(langOverride) {
               maxConf = p.confidence;
             }
             if (p.confidence >= detectionThreshold && p.scientificName) {
-              if (!verifiedDetections.has(p.scientificName) && !pendingDetections.has(p.scientificName)) {
-                pendingDetections.set(p.scientificName, now);
+              // Cancel any pending rejection timeout
+              if (pendingRejections.has(p.scientificName)) {
+                clearTimeout(pendingRejections.get(p.scientificName));
+                pendingRejections.delete(p.scientificName);
+              }
+
+              if (!verifiedDetections.has(p.scientificName)) {
+                if (!pendingDetections.has(p.scientificName)) {
+                  pendingDetections.set(p.scientificName, now);
+                }
+
+                // Add or update liveHistoryDetections
+                const existing = liveHistoryDetections.find(d => d.scientificName === p.scientificName);
+                if (!existing) {
+                  liveHistoryDetections.unshift({
+                    scientificName: p.scientificName,
+                    commonName: p.commonName,
+                    commonNameI18n: p.commonNameI18n || p.commonName,
+                    confidence: p.confidence,
+                    status: "analyzing",
+                    timestamp: now,
+                    lastSeen: now
+                  });
+                } else {
+                  existing.lastSeen = now;
+                  if (existing.status === "analyzing") {
+                    existing.confidence = Math.max(existing.confidence, p.confidence);
+                  }
+                }
+              } else {
+                // Already verified, update lastSeen
+                const existing = liveHistoryDetections.find(d => d.scientificName === p.scientificName);
+                if (existing) {
+                  existing.lastSeen = now;
+                }
               }
             }
           });
@@ -476,7 +509,7 @@ function initWorker(langOverride) {
           }
         }
 
-        renderDetections(toRender);
+        renderDetections();
         
         if (isListening && lastInferenceStart) {
           lastInferenceMs = Math.round(performance.now() - lastInferenceStart);
@@ -511,9 +544,11 @@ function initWorker(langOverride) {
     if (type === "PIPELINE_STATUS") {
       // WebGPU downgrade notification from segmentation worker
       const { status, message } = payload || {};
-      console.warn(`[App] Pipeline B status: ${status} — ${message}`);
-      const warningEl = document.getElementById("webgpuWarning");
-      if (warningEl) warningEl.classList.remove("d-none");
+      console.log(`[App] Pipeline B status: ${status} — ${message}`);
+      if (status === "webgpu_fallback" || status === "error") {
+        const warningEl = document.getElementById("webgpuWarning");
+        if (warningEl) warningEl.classList.remove("d-none");
+      }
       return;
     }
 
@@ -534,6 +569,7 @@ function initWorker(langOverride) {
             res.predictions.forEach(pred => {
               if (pred.scientificName && pred.confidence >= detectionThreshold) {
                 console.log(`[Consensus] Verifying species: ${pred.scientificName} with confidence ${pred.confidence}`);
+                console.log(`[Consensus] Storing verified detection: ${pred.scientificName}, audioBuffer:`, res.audioBuffer);
                 verifiedDetections.set(pred.scientificName, {
                   confidence: pred.confidence,
                   audioBuffer: res.audioBuffer, // Float32Array isolated channel audio
@@ -541,24 +577,57 @@ function initWorker(langOverride) {
                 });
                 verifiedThisSegment.add(pred.scientificName);
                 pendingDetections.delete(pred.scientificName);
+
+                // Cancel any pending rejection timeout
+                if (pendingRejections.has(pred.scientificName)) {
+                  clearTimeout(pendingRejections.get(pred.scientificName));
+                  pendingRejections.delete(pred.scientificName);
+                }
+
+                // Append verified species to liveHistoryDetections so it appears in the UI
+                const existing = liveHistoryDetections.find(d => d.scientificName === pred.scientificName);
+                if (!existing) {
+                  liveHistoryDetections.unshift({
+                    scientificName: pred.scientificName,
+                    commonName: pred.commonName,
+                    commonNameI18n: pred.commonNameI18n || pred.commonName,
+                    confidence: pred.confidence,
+                    status: "verified",
+                    timestamp: timestamp,
+                    lastSeen: timestamp
+                  });
+                } else {
+                  existing.status = "verified";
+                  existing.confidence = Math.max(existing.confidence, pred.confidence);
+                  existing.timestamp = timestamp;
+                }
                 updated = true;
               }
             });
           }
         });
 
-        // Timeline reconciliation: unmount unverified detections
-        const segmentStart = timestamp - 9000;
+        // Timeline reconciliation: unmount unverified detections (with a 2-second grace period)
+        const segmentStart = timestamp - (pipelineBWindow * 1000);
         const segmentEnd = timestamp;
 
         pendingDetections.forEach((detectedAt, sciName) => {
           if (detectedAt >= segmentStart && detectedAt <= segmentEnd) {
             if (!verifiedThisSegment.has(sciName)) {
-              console.log(`[Consensus] Rejecting false positive: ${sciName}`);
-              pendingDetections.delete(sciName);
-              // Remove from latestDetections
-              latestDetections = latestDetections.filter(d => d.scientificName !== sciName);
-              updated = true;
+              if (!pendingRejections.has(sciName)) {
+                console.log(`[Consensus] Rejecting false positive after grace period: ${sciName}`);
+                const timeoutId = setTimeout(() => {
+                  pendingRejections.delete(sciName);
+                  pendingDetections.delete(sciName);
+                  // Remove from liveHistoryDetections if still analyzing
+                  const idx = liveHistoryDetections.findIndex(d => d.scientificName === sciName);
+                  if (idx !== -1 && liveHistoryDetections[idx].status === "analyzing") {
+                    liveHistoryDetections.splice(idx, 1);
+                    renderDetections();
+                  }
+                }, 2000); // 2-second grace period
+                pendingRejections.set(sciName, timeoutId);
+              }
             }
           }
         });
@@ -673,6 +742,9 @@ function stopListening() {
   lastInferenceMs = null;
   verifiedDetections.clear();
   pendingDetections.clear();
+  liveHistoryDetections = [];
+  pendingRejections.forEach(tId => clearTimeout(tId));
+  pendingRejections.clear();
   stopIsolatedAudio();
 
   // Cleanup Audio
@@ -749,6 +821,67 @@ async function setupAudioGraphFromStream(stream, ctx) {
     },
     onInferenceStart: () => {
       lastInferenceStart = performance.now();
+    },
+    onEarlyExit: (pcm) => {
+      // Verify all pending drafts in the current segment window using the raw audio slice
+      const now = Date.now();
+      const windowMs = pipelineBWindow * 1000;
+      const segmentStart = now - windowMs;
+      const segmentEnd = now;
+      let updated = false;
+
+      pendingDetections.forEach((detectedAt, sciName) => {
+        if (detectedAt >= segmentStart && detectedAt <= segmentEnd) {
+          console.log(`[Consensus] Verifying via Early Exit Fallback: ${sciName}`);
+          
+          // Cancel any pending rejection timeout
+          if (pendingRejections.has(sciName)) {
+            clearTimeout(pendingRejections.get(sciName));
+            pendingRejections.delete(sciName);
+          }
+
+          // We try to find common name in history or default it
+          let cName = sciName;
+          let cNameI18n = sciName;
+          const histMatch = liveHistoryDetections.find(d => d.scientificName === sciName);
+          if (histMatch) {
+            cName = histMatch.commonName;
+            cNameI18n = histMatch.commonNameI18n;
+          }
+
+          const conf = histMatch ? histMatch.confidence : earlyExitConfidence;
+          
+          verifiedDetections.set(sciName, {
+            confidence: conf,
+            audioBuffer: new Float32Array(pcm),
+            timestamp: now
+          });
+
+          // Update history entry to verified
+          if (histMatch) {
+            histMatch.status = "verified";
+            histMatch.confidence = Math.max(histMatch.confidence, conf);
+            histMatch.timestamp = now;
+          } else {
+            liveHistoryDetections.unshift({
+              scientificName: sciName,
+              commonName: cName,
+              commonNameI18n: cNameI18n,
+              confidence: conf,
+              status: "verified",
+              timestamp: now,
+              lastSeen: now
+            });
+          }
+
+          pendingDetections.delete(sciName);
+          updated = true;
+        }
+      });
+
+      if (updated) {
+        renderDetections();
+      }
     },
     getBConfig: () => ({
       windowSize: pipelineBWindow,
@@ -1162,8 +1295,11 @@ function initUIControls() {
       currentLabelLang = langSelect.value;
       store.set("bn_lang", currentLabelLang);
       latestDetections = [];
+      liveHistoryDetections = [];
+      pendingRejections.forEach(tId => clearTimeout(tId));
+      pendingRejections.clear();
       verifiedDetections.clear();
-      renderDetections([]);
+      renderDetections();
       
       if (liveWorker && workerReady) {
         updateStatus("status_reloading_model");
@@ -1326,20 +1462,21 @@ function setupSettingsToggle() {
  * Renders the list of detected species (Live View).
  * Uses DOM diffing to prevent flickering of images.
  */
-function renderDetections(pooled) {
-  if (Array.isArray(pooled)) latestDetections = pooled;
+function renderDetections() {
   const container = detectionsList();
   if (!container) return;
   
   const useGeoFilter = geoEnabled && !!geolocation;
-  const all = latestDetections || [];
+  const all = liveHistoryDetections || [];
 
   // Filter by Geo (if enabled) and Confidence
   const afterGeo = useGeoFilter
-    ? all.filter(p => typeof p.geoscore === "number" && p.geoscore >= 0.05)
+    ? all.filter(p => typeof p.geoscore === "number" ? p.geoscore >= 0.05 : true)
     : all;
   const afterAudio = afterGeo.filter(p => p.confidence >= detectionThreshold);
-  const top = afterAudio.sort((a, b) => b.confidence - a.confidence).slice(0, 20);
+  
+  // Sort chronologically descending so newest verified/analyzing species are on top
+  const top = afterAudio.sort((a, b) => b.timestamp - a.timestamp);
 
   // Empty State
   if (!top.length) {
@@ -1375,25 +1512,30 @@ function renderDetections(pooled) {
     const commonName = p.commonNameI18n || p.commonName || `Class ${p.index}`;
     const scientificName = p.scientificName || "";
     const key = scientificName || `idx-${p.index}`;
-    const imgUrl = `https://birdnet.cornell.edu/api2/bird/${encodeURIComponent(scientificName)}.webp`;
 
     newKeys.add(key);
     let cardCol = existingCards.get(key);
 
-    const isVerified = verifiedDetections.has(scientificName);
+    const isVerified = (p.status === "verified");
 
     const playBtnHtml = isVerified
       ? (currentlyPlayingSpecies === scientificName
           ? `<button class="btn btn-sm btn-outline-danger py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" onclick="stopIsolatedAudio()">
                <i class="bi bi-stop-fill me-1"></i>Stop
              </button>`
-          : `<button class="btn btn-sm btn-outline-primary py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" onclick="playIsolatedAudio('${scientificName.replace(/'/g, "\\'")}')">
+          : `<button class="btn btn-sm btn-outline-primary py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" onclick="playIsolatedAudio('${scientificName.replace(/'/g, "\\'")}')" ${!verifiedDetections.get(scientificName)?.audioBuffer ? 'disabled' : ''}>
                <i class="bi bi-play-fill me-1"></i>Play Isolated
              </button>`
         )
       : `<button class="btn btn-sm btn-outline-secondary py-0 px-2 play-audio-btn" style="font-size: 0.75rem;" disabled>
-           <i class="bi bi-hourglass me-1"></i>Analyzing
+           <i class="bi bi-hourglass-split spin-icon me-1"></i>Analyzing...
          </button>`;
+
+    const downloadBtnHtml = isVerified && verifiedDetections.get(scientificName)?.audioBuffer
+      ? `<button class="btn btn-sm btn-outline-secondary py-0 px-2 ms-1" style="font-size: 0.75rem;" onclick="downloadIsolatedAudio('${scientificName.replace(/'/g, "\\'")}')" title="Download isolated audio channel">
+           <i class="bi bi-download"></i>
+         </button>`
+      : '';
 
     if (cardCol) {
       // UPDATE existing card (text only)
@@ -1427,7 +1569,7 @@ function renderDetections(pooled) {
 
       const playBtnContainer = cardCol.querySelector(".play-btn-container");
       if (playBtnContainer) {
-        playBtnContainer.innerHTML = playBtnHtml;
+        playBtnContainer.innerHTML = playBtnHtml + downloadBtnHtml;
       }
 
       container.appendChild(cardCol); // Re-order
@@ -1441,13 +1583,17 @@ function renderDetections(pooled) {
         ? `<span class="badge bg-primary bg-opacity-10 text-primary border border-primary border-opacity-10 flex-shrink-0">${confPct}%</span>`
         : `<span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10 flex-shrink-0"><i class="bi bi-arrow-repeat spin-icon me-1"></i>${confPct}% (Analyzing)</span>`;
 
+      const wikiLang = currentUiLang || "en";
+      const wikiUrl = `https://${wikiLang}.wikipedia.org/wiki/${encodeURIComponent(scientificName)}`;
+      const ebirdUrl = `https://www.google.com/search?q=site:ebird.org/species/+${encodeURIComponent(scientificName)}`;
       const cardPendingClass = isVerified ? "" : "card-pending";
 
       cardCol.innerHTML = `
         <div class="card h-100 border-0 shadow-sm overflow-hidden ${cardPendingClass}">
           <div class="d-flex h-100">
             <div class="flex-shrink-0 position-relative" style="width: 90px; background-color: #f8f9fa;">
-              <img src="${imgUrl}" 
+              <img src="img/dummy.webp" 
+                   data-scientific-name="${scientificName}"
                    alt="${commonName}"
                    loading="lazy"
                    style="width: 100%; height: 100%; object-fit: cover;"
@@ -1459,7 +1605,18 @@ function renderDetections(pooled) {
                   <h6 class="card-title mb-0 fw-bold text-primary text-truncate me-2" style="min-width: 0; font-size: 0.95rem;" title="${commonName}">${commonName}</h6>
                   ${badgeHtml}
                 </div>
-                ${scientificName ? `<div class="text-muted fst-italic small mb-2 text-truncate" style="font-size: 0.8rem;">${scientificName}</div>` : ""}
+                ${scientificName ? `
+                  <div class="text-muted fst-italic small mb-1 text-truncate" style="font-size: 0.8rem;">${scientificName}</div>
+                  <div class="d-flex align-items-center gap-2 mb-2">
+                    <a href="${wikiUrl}" target="_blank" rel="noopener" class="species-link" title="Wikipedia">
+                      <i class="bi bi-wikipedia"></i> Wikipedia
+                    </a>
+                    <span class="species-links-divider">|</span>
+                    <a href="${ebirdUrl}" target="_blank" rel="noopener" data-ebird-scientific="${scientificName}" class="species-link" title="eBird">
+                      <i class="bi bi-box-arrow-up-right"></i> eBird
+                    </a>
+                  </div>
+                ` : ""}
               </div>
               <div>
                 <div class="d-flex justify-content-between align-items-center border-top pt-2 mt-1">
@@ -1468,6 +1625,7 @@ function renderDetections(pooled) {
                   </span>
                   <div class="play-btn-container">
                     ${playBtnHtml}
+                    ${downloadBtnHtml}
                   </div>
                 </div>
               </div>
@@ -1476,6 +1634,15 @@ function renderDetections(pooled) {
         </div>
       `;
       container.appendChild(cardCol);
+
+      const imgEl = cardCol.querySelector('img[data-scientific-name]');
+      if (imgEl) {
+        loadSpeciesImage(scientificName, imgEl, 'img/dummy.webp');
+      }
+      const ebirdLinkEl = cardCol.querySelector(`a[data-ebird-scientific="${scientificName}"]`);
+      if (ebirdLinkEl) {
+        loadEbirdLink(scientificName, ebirdLinkEl);
+      }
     }
   });
 
@@ -1519,15 +1686,19 @@ function renderExploreList(list) {
   sorted.forEach(bird => {
     const scorePct = (bird.geoscore * 100).toFixed(1);
     const common = bird.commonNameI18n || bird.commonName;
-    const imgUrl = `https://birdnet.cornell.edu/api2/bird/${encodeURIComponent(bird.scientificName)}.webp`;
     
+    const wikiLang = currentUiLang || "en";
+    const wikiUrl = `https://${wikiLang}.wikipedia.org/wiki/${encodeURIComponent(bird.scientificName)}`;
+    const ebirdUrl = `https://www.google.com/search?q=site:ebird.org/species/+${encodeURIComponent(bird.scientificName)}`;
+
     const col = document.createElement("div");
     col.className = "col-md-6 col-lg-4";
     col.innerHTML = `
       <div class="card h-100 border-0 shadow-sm overflow-hidden">
         <div class="d-flex h-100">
           <div class="flex-shrink-0 position-relative" style="width: 90px; background-color: #f8f9fa;">
-            <img src="${imgUrl}" 
+            <img src="img/dummy.webp" 
+                 data-scientific-name="${bird.scientificName}"
                  alt="${common}"
                  loading="lazy"
                  style="width: 100%; height: 100%; object-fit: cover;"
@@ -1537,7 +1708,16 @@ function renderExploreList(list) {
             <div class="d-flex justify-content-between align-items-start mb-1">
               <div class="overflow-hidden me-2">
                 <h6 class="card-title mb-0 fw-bold text-dark text-truncate" style="font-size: 0.95rem;" title="${common}">${common}</h6>
-                <div class="text-muted fst-italic small mt-1 text-truncate" style="font-size: 0.8rem;">${bird.scientificName}</div>
+                <div class="text-muted fst-italic small mt-1 mb-1 text-truncate" style="font-size: 0.8rem;">${bird.scientificName}</div>
+                <div class="d-flex align-items-center gap-2 mb-2">
+                  <a href="${wikiUrl}" target="_blank" rel="noopener" class="species-link" title="Wikipedia">
+                    <i class="bi bi-wikipedia"></i> Wikipedia
+                  </a>
+                  <span class="species-links-divider">|</span>
+                  <a href="${ebirdUrl}" target="_blank" rel="noopener" data-ebird-scientific="${bird.scientificName}" class="species-link" title="eBird">
+                    <i class="bi bi-box-arrow-up-right"></i> eBird
+                  </a>
+                </div>
               </div>
               <span class="badge bg-light text-dark border flex-shrink-0">
                 ${scorePct}%
@@ -1553,6 +1733,15 @@ function renderExploreList(list) {
       </div>
     `;
     container.appendChild(col);
+
+    const imgEl = col.querySelector('img[data-scientific-name]');
+    if (imgEl) {
+      loadSpeciesImage(bird.scientificName, imgEl, 'img/dummy.webp');
+    }
+    const ebirdLinkEl = col.querySelector(`a[data-ebird-scientific="${bird.scientificName}"]`);
+    if (ebirdLinkEl) {
+      loadEbirdLink(bird.scientificName, ebirdLinkEl);
+    }
   });
 }
 
@@ -1728,27 +1917,64 @@ function computeTemporalPooledDetections(sets) {
    13. AUDIO PLAYBACK UTILITIES
    ========================================================================== */
 
-function playIsolatedAudio(scientificName) {
+async function playIsolatedAudio(scientificName) {
+  console.log("[playIsolatedAudio] Request to play:", scientificName);
   if (currentlyPlayingSpecies === scientificName) {
+    console.log("[playIsolatedAudio] Stopping currently playing:", scientificName);
     stopIsolatedAudio();
     return;
   }
 
   const verified = verifiedDetections.get(scientificName);
-  if (!verified || !verified.audioBuffer) return;
+  console.log("[playIsolatedAudio] verified entry from Map:", verified);
+  if (!verified) {
+    console.warn("[playIsolatedAudio] No verified entry found for:", scientificName);
+    return;
+  }
+  if (!verified.audioBuffer) {
+    console.warn("[playIsolatedAudio] verified entry has no audioBuffer for:", scientificName);
+    return;
+  }
+  console.log("[playIsolatedAudio] verified.audioBuffer length:", verified.audioBuffer.length);
 
   try {
     stopIsolatedAudio();
 
     if (!playbackAudioContext) {
-      playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      try {
+        playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      } catch (e) {
+        console.warn("[playIsolatedAudio] Failed to create AudioContext with sampleRate, falling back to default constructor:", e);
+        playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
     }
     if (playbackAudioContext.state === "suspended") {
-      playbackAudioContext.resume();
+      await playbackAudioContext.resume();
     }
 
-    const audioBuf = playbackAudioContext.createBuffer(1, verified.audioBuffer.length, 48000);
-    audioBuf.getChannelData(0).set(verified.audioBuffer);
+    // Peak normalize the track so it's clearly audible
+    const samples = verified.audioBuffer;
+    let maxVal = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const abs = Math.abs(samples[i]);
+      if (abs > maxVal) maxVal = abs;
+    }
+
+    const normalized = new Float32Array(samples.length);
+    if (maxVal > 0.0001) {
+      const gain = 0.8 / maxVal;
+      const clampedGain = Math.min(20.0, gain); // up to 20x gain boost
+      console.log(`[playIsolatedAudio] Normalizing audio. Peak: ${maxVal.toFixed(4)}, Applied Gain: ${clampedGain.toFixed(2)}x`);
+      for (let i = 0; i < samples.length; i++) {
+        normalized[i] = samples[i] * clampedGain;
+      }
+    } else {
+      console.log("[playIsolatedAudio] Track is near-silent. Playing raw samples.");
+      normalized.set(samples);
+    }
+
+    const audioBuf = playbackAudioContext.createBuffer(1, normalized.length, playbackAudioContext.sampleRate);
+    audioBuf.getChannelData(0).set(normalized);
 
     const source = playbackAudioContext.createBufferSource();
     source.buffer = audioBuf;
@@ -1854,5 +2080,184 @@ function populateSeparatorDropdowns() {
   }
 }
 
-window.playIsolatedAudio = playIsolatedAudio;
-window.stopIsolatedAudio = stopIsolatedAudio;
+function bufferToWav(buffer, sampleRate) {
+  const bufferLength = buffer.length;
+  const wavHeader = new ArrayBuffer(44);
+  const view = new DataView(wavHeader);
+
+  function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + bufferLength * 2, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, bufferLength * 2, true);
+
+  const pcmBuffer = new Int16Array(bufferLength);
+  for (let i = 0; i < bufferLength; i++) {
+    const s = Math.max(-1, Math.min(1, buffer[i]));
+    pcmBuffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+
+  return new Blob([wavHeader, pcmBuffer], { type: 'audio/wav' });
+}
+
+function downloadIsolatedAudio(scientificName) {
+  const verified = verifiedDetections.get(scientificName);
+  if (!verified || !verified.audioBuffer) {
+    console.warn("[downloadIsolatedAudio] No verified audio buffer found for", scientificName);
+    return;
+  }
+  
+  const samples = verified.audioBuffer;
+  let maxVal = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const abs = Math.abs(samples[i]);
+    if (abs > maxVal) maxVal = abs;
+  }
+
+  const normalized = new Float32Array(samples.length);
+  if (maxVal > 0.0001) {
+    const gain = 0.8 / maxVal;
+    const clampedGain = Math.min(20.0, gain);
+    for (let i = 0; i < samples.length; i++) {
+      normalized[i] = samples[i] * clampedGain;
+    }
+  } else {
+    normalized.set(samples);
+  }
+
+  const sampleRate = playbackAudioContext ? playbackAudioContext.sampleRate : 48000;
+  const wavBlob = bufferToWav(normalized, sampleRate);
+  const url = URL.createObjectURL(wavBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${scientificName.replace(/\s+/g, '_')}_isolated.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Bind functions to window context for onclick handlers (only on live dashboard page)
+if (document.getElementById("liveSpectrogram")) {
+  window.playIsolatedAudio = playIsolatedAudio;
+  window.stopIsolatedAudio = stopIsolatedAudio;
+  window.downloadIsolatedAudio = downloadIsolatedAudio;
+}
+
+// Cache to avoid querying Wikipedia multiple times for the same species in the same session
+const speciesImageCache = new Map();
+
+/**
+ * Dynamically fetches a species image from Wikipedia API using its scientific name.
+ * If found, sets the src of the target image element.
+ * If it fails, falls back to the default dummy image.
+ */
+async function loadSpeciesImage(scientificName, imgElement, fallbackPath = 'img/dummy.webp') {
+  if (!scientificName) {
+    imgElement.src = fallbackPath;
+    return;
+  }
+
+  // Check cache first
+  if (speciesImageCache.has(scientificName)) {
+    const cachedUrl = speciesImageCache.get(scientificName);
+    imgElement.src = cachedUrl || fallbackPath;
+    return;
+  }
+
+  try {
+    // Wikipedia API call to get page image by title (supporting redirects, e.g. scientific name to common name)
+    const url = `https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&prop=pageimages&titles=${encodeURIComponent(scientificName)}&pithumbsize=250&redirects=1&formatversion=2`;
+    
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    const page = data.query?.pages?.[0];
+    
+    if (page && page.thumbnail && page.thumbnail.source) {
+      const imgUrl = page.thumbnail.source;
+      speciesImageCache.set(scientificName, imgUrl);
+      imgElement.src = imgUrl;
+    } else {
+      // Try search if direct page title query failed to find page image
+      const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=${encodeURIComponent(scientificName)}&gsrlimit=1&prop=pageimages&pithumbsize=250&formatversion=2`;
+      const searchResponse = await fetch(searchUrl);
+      if (searchResponse.ok) {
+        const searchData = await searchResponse.json();
+        const searchPage = searchData.query?.pages?.[0];
+        if (searchPage && searchPage.thumbnail && searchPage.thumbnail.source) {
+          const imgUrl = searchPage.thumbnail.source;
+          speciesImageCache.set(scientificName, imgUrl);
+          imgElement.src = imgUrl;
+          return;
+        }
+      }
+      
+      speciesImageCache.set(scientificName, null);
+      imgElement.src = fallbackPath;
+    }
+  } catch (error) {
+    console.warn(`Failed to fetch Wikipedia image for ${scientificName}:`, error);
+    imgElement.src = fallbackPath;
+  }
+}
+
+// Cache to avoid querying Wikidata multiple times for the same eBird species code
+const ebirdCodeCache = new Map();
+
+/**
+ * Dynamically resolves the eBird species code via Wikidata SPARQL.
+ * Upgrades the link from the Google fallback to the direct ebird.org species profile once resolved.
+ */
+async function loadEbirdLink(scientificName, anchorElement) {
+  if (!scientificName) return;
+
+  // Check cache first
+  if (ebirdCodeCache.has(scientificName)) {
+    const cachedCode = ebirdCodeCache.get(scientificName);
+    if (cachedCode) {
+      anchorElement.href = `https://ebird.org/species/${cachedCode}`;
+    }
+    return;
+  }
+
+  try {
+    const endpoint = "https://query.wikidata.org/sparql";
+    const query = `SELECT ?ebirdCode WHERE { ?item wdt:P225 "${scientificName}". ?item wdt:P3425 ?ebirdCode. } LIMIT 1`;
+    const url = `${endpoint}?query=${encodeURIComponent(query)}&format=json`;
+    
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/sparql-results+json"
+      }
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      const code = data.results?.bindings?.[0]?.ebirdCode?.value;
+      if (code) {
+        ebirdCodeCache.set(scientificName, code);
+        anchorElement.href = `https://ebird.org/species/${code}`;
+      } else {
+        ebirdCodeCache.set(scientificName, null);
+      }
+    }
+  } catch (error) {
+    console.warn(`Failed to fetch eBird code for ${scientificName} via Wikidata:`, error);
+  }
+}

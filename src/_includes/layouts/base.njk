@@ -34,6 +34,14 @@
       window.addEventListener('load', () => {
         navigator.serviceWorker.register("{{ '/sw.js' | url }}").catch(console.error);
       });
+      // Force page reload if service worker changes to avoid stale cache issues
+      let refreshing = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!refreshing) {
+          refreshing = true;
+          window.location.reload();
+        }
+      });
     }
   </script>
 </body>

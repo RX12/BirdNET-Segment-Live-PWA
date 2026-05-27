@@ -28,6 +28,51 @@ permalink: "/about/"
 
         <hr class="my-5">
 
+        <h2 class="h3 fw-bold mb-3" data-i18n="about_fork_title">Features of this Fork</h2>
+        <p data-i18n="about_fork_p1">
+          This fork adds parallel processing to separate multiple bird voices from background noise and improve detection:
+        </p>
+        <div class="d-flex flex-column gap-3 mb-4">
+          <div class="d-flex gap-3">
+            <div class="flex-shrink-0 mt-1">
+              <i class="bi bi-cpu text-primary fs-4"></i>
+            </div>
+            <div>
+              <h5 class="fw-semibold mb-1" data-i18n="about_fork_feat1_title">Dual-Pipeline Identification</h5>
+              <p class="text-muted mb-0" data-i18n="about_fork_feat1_desc">Runs the standard BirdNET classifier to detect birds in the background, while separating the audio stream in parallel into up to 4 clean, isolated channels.</p>
+            </div>
+          </div>
+          <div class="d-flex gap-3">
+            <div class="flex-shrink-0 mt-1">
+              <i class="bi bi-shield-check text-primary fs-4"></i>
+            </div>
+            <div>
+              <h5 class="fw-semibold mb-1" data-i18n="about_fork_feat2_title">Verification & Consensus</h5>
+              <p class="text-muted mb-0" data-i18n="about_fork_feat2_desc">Compares detections from the raw audio with the separated channels to filter out false alarms caused by background noise. Uses silence detection to save battery.</p>
+            </div>
+          </div>
+          <div class="d-flex gap-3">
+            <div class="flex-shrink-0 mt-1">
+              <i class="bi bi-play-circle text-primary fs-4"></i>
+            </div>
+            <div>
+              <h5 class="fw-semibold mb-1" data-i18n="about_fork_feat3_title">Isolated Playback & Download</h5>
+              <p class="text-muted mb-0" data-i18n="about_fork_feat3_desc">Listen to or download a clean WAV file of the isolated bird call instead of the noisy original mix.</p>
+            </div>
+          </div>
+          <div class="d-flex gap-3">
+            <div class="flex-shrink-0 mt-1">
+              <i class="bi bi-graph-up text-primary fs-4"></i>
+            </div>
+            <div>
+              <h5 class="fw-semibold mb-1" data-i18n="about_fork_feat4_title">Offline File Debugger</h5>
+              <p class="text-muted mb-0" data-i18n="about_fork_feat4_desc">Analyze uploaded audio files with a debugger showing separate predictions, players, and downloads for all 4 channels.</p>
+            </div>
+          </div>
+        </div>
+
+        <hr class="my-5">
+
         <h2 class="h3 fw-bold mb-3" data-i18n="about_birdnet_title">What is BirdNET?</h2>
         <p data-i18n="about_birdnet_p1">
           BirdNET is a research platform developed jointly by the <strong>K. Lisa Yang Center for Conservation Bioacoustics</strong> at the Cornell Lab of Ornithology and the <strong>Chemnitz University of Technology</strong>.
@@ -111,7 +156,7 @@ permalink: "/about/"
             <p class="text-muted mb-4" data-i18n="about_github_desc">
               The source code for BirdNET Live is available on GitHub. Feel free to inspect the code, report issues, or contribute improvements!
             </p>
-            <a href="https://github.com/birdnet-team/real-time-pwa" target="_blank" class="btn btn-primary">
+            <a href="https://github.com/RX12/BirdNET-Segment-Live-PWA" target="_blank" class="btn btn-primary">
               <span data-i18n="about_btn_repo">View Repository</span> <i class="bi bi-box-arrow-up-right ms-1"></i>
             </a>
           </div>

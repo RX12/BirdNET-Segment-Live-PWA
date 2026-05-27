@@ -9,16 +9,15 @@
    1. IMPORTS & CONFIGURATION
    ========================================================================== */
 
-const params = new URL(self.location.href).searchParams;
-const TF_PATH = params.get('tf') || 'js/tfjs-4.14.0.min.js';
-const prefix = self.location.origin + (params.get('prefix') || '/');
+const prefix = self.location.origin + self.location.pathname.substring(0, self.location.pathname.lastIndexOf('/js/')) + '/';
+const TF_PATH = prefix + 'js/tfjs-4.14.0.min.js';
 const TFLITE_PATH = prefix + 'js/tf-tflite.min.js';
 const WASM_PATH = prefix + 'tflite-wasm/';
 const ORT_PATH = prefix + 'js/ort.min.js';
 const ORT_WASM_PATH = prefix + 'onnx-wasm/';
 
-const runOnGPU = params.get('runOnGPU') !== 'false';
-let currentOutputSampleRate = parseInt(params.get('outputSampleRate') || '48000', 10);
+let currentOutputSampleRate = 48000;
+let currentPipelineBWindow = 9.0;
 
 importScripts(TF_PATH);
 importScripts(TFLITE_PATH);
@@ -53,9 +52,10 @@ class AudioSeparator {
 }
 
 class ONNXAudioSeparator extends AudioSeparator {
-    constructor(modelPath) {
+    constructor(modelPath, runOnGPU) {
         super();
         this.modelPath = modelPath;
+        this.runOnGPU = runOnGPU !== false;
         this.session = null;
         this.hasFailedToLoad = false;
     }
@@ -64,7 +64,7 @@ class ONNXAudioSeparator extends AudioSeparator {
         try {
             console.log(`[ONNXAudioSeparator] Loading model from ${this.modelPath}...`);
             // Attempt to load using WebGPU first (if enabled), falling back to WebAssembly
-            const providers = runOnGPU ? ['webgpu', 'wasm'] : ['wasm'];
+            const providers = this.runOnGPU ? ['webgpu', 'wasm'] : ['wasm'];
             this.session = await ort.InferenceSession.create(this.modelPath, {
                 executionProviders: providers
             });
@@ -106,7 +106,7 @@ class ONNXAudioSeparator extends AudioSeparator {
             const outputNames = Object.keys(results);
             const tracks = [];
 
-            // If there is only a single output tensor, check if it contains multiple channels (e.g., Demucs shape [1, 2, samples])
+            // If there is only a single output tensor, check if it contains multiple channels (e.g., Bird-MixIT shape [1, 4, samples])
             if (outputNames.length === 1) {
                 const name = outputNames[0];
                 const tensor = results[name];
@@ -120,7 +120,6 @@ class ONNXAudioSeparator extends AudioSeparator {
                             for (let c = 0; c < numChannels; c++) {
                                 const start = c * sampleLength;
                                 const end = start + sampleLength;
-                                // Create a sliced view or copy
                                 tracks.push(new Float32Array(tensor.data.subarray(start, end)));
                             }
                         }
@@ -138,33 +137,81 @@ class ONNXAudioSeparator extends AudioSeparator {
                 }
             }
 
+            // Check for silent/NaN outputs (silent failure of WebGPU execution provider)
+            let maxOutputVal = 0;
+            let containsNaN = false;
+            for (const track of tracks) {
+                for (let i = 0; i < track.length; i++) {
+                    const val = track[i];
+                    if (isNaN(val)) {
+                        containsNaN = true;
+                        break;
+                    }
+                    const abs = Math.abs(val);
+                    if (abs > maxOutputVal) maxOutputVal = abs;
+                }
+                if (containsNaN) break;
+            }
+
+            if (containsNaN || maxOutputVal < 0.00001) {
+                const reason = containsNaN ? "NaN values in output" : `output is silent (peak: ${maxOutputVal})`;
+                console.warn(`[ONNXAudioSeparator] ONNX execution returned invalid output: ${reason}. Triggering fallback/reload...`);
+                throw new Error(`ONNX execution returned invalid tensor data: ${reason}`);
+            }
+
             if (tracks.length > 0) {
                 return tracks;
             } else {
                 throw new Error("No valid Float32Array tracks found in ONNX outputs.");
             }
         } catch (err) {
-            console.error(`[ONNXAudioSeparator] ONNX run failed, permanently downgrading to DSP separation:`, err);
+            console.error(`[ONNXAudioSeparator] ONNX run failed:`, err);
 
-            // MOBILE FIX: Permanently downgrade on OOM / device-lost.
-            // On mobile GPUs, once a WebGPU device is lost or runs out of memory,
-            // the session is corrupted. Retrying every 4.5s wastes GPU cycles and
-            // can cause thermal throttling. Mark as permanently failed.
-            this.hasFailedToLoad = true;
+            // Release the broken session
             try { this.session.release(); } catch (_) {}
             this.session = null;
 
-            // Notify main thread so the UI can reflect the downgrade
-            self.postMessage({
-                type: "PIPELINE_STATUS",
-                payload: {
-                    status: "webgpu_fallback",
-                    message: "WebGPU execution failed. Pipeline B is running on CPU (DSP fallback).",
-                    error: err.message
+            // Attempt to reload the session with WASM-only execution before giving up
+            if (this.modelPath && !this._wasmRetried) {
+                this._wasmRetried = true;
+                console.log(`[ONNXAudioSeparator] Attempting WASM-only session reload for model: ${this.modelPath}`);
+                self.postMessage({
+                    type: "PIPELINE_STATUS",
+                    payload: {
+                        status: "webgpu_fallback",
+                        message: "WebGPU execution failed. Reloading model with WASM (CPU) backend...",
+                        error: err.message
+                    }
+                });
+                try {
+                    this.session = await ort.InferenceSession.create(this.modelPath, {
+                        executionProviders: ['wasm']
+                    });
+                    console.log(`[ONNXAudioSeparator] WASM-only session loaded successfully. Retrying separation...`);
+                    // Retry with the new WASM session
+                    return await this.separate(audioBuffer);
+                } catch (reloadErr) {
+                    console.error(`[ONNXAudioSeparator] WASM reload also failed. Permanently downgrading to DSP:`, reloadErr);
+                    this.hasFailedToLoad = true;
+                    this.session = null;
+                    return this.dspSeparate(audioBuffer);
                 }
-            });
+            } else {
+                // Already tried WASM reload or no model path — permanent DSP fallback
+                console.error(`[ONNXAudioSeparator] Permanently downgrading to DSP separation.`);
+                this.hasFailedToLoad = true;
 
-            return this.dspSeparate(audioBuffer);
+                self.postMessage({
+                    type: "PIPELINE_STATUS",
+                    payload: {
+                        status: "webgpu_fallback",
+                        message: "ONNX execution failed on all backends. Pipeline B is running on CPU (DSP fallback).",
+                        error: err.message
+                    }
+                });
+
+                return this.dspSeparate(audioBuffer);
+            }
         }
     }
 
@@ -203,19 +250,41 @@ let isReady = false;
    4. INITIALIZATION
    ========================================================================== */
 
-init();
+// Initialization is triggered via 'INIT' message from the main thread
 
-async function init() {
+async function init(separator, modelPath, runOnGPU, outputSampleRate, lang, pipelineBWindow) {
+    separator = separator || 'biocppnet';
+    modelPath = modelPath || '';
+    runOnGPU = runOnGPU !== false;
+    if (outputSampleRate !== undefined) {
+        currentOutputSampleRate = outputSampleRate;
+    }
+    if (pipelineBWindow !== undefined) {
+        currentPipelineBWindow = pipelineBWindow;
+    }
     try {
         await tf.setBackend('cpu');
 
+        self.postMessage({
+            type: "PIPELINE_STATUS",
+            payload: {
+                status: "loading",
+                message: "Loading metadata labels..."
+            }
+        });
+
         // 1. Load Labels
-        await loadLabels();
+        await loadLabels(lang);
+
+        self.postMessage({
+            type: "PIPELINE_STATUS",
+            payload: {
+                status: "loading",
+                message: `Loading separator model (${separator})...`
+            }
+        });
 
         // 2. Load Separator Model
-        const separator = params.get('separator') || 'biocppnet';
-        const modelPath = params.get('modelPath') || '';
-
         if (separator === 'dsp') {
             console.log("[Segmentation Worker] Configured to use DSP crossover filter directly.");
             separatorModel = new ONNXAudioSeparator("");
@@ -225,14 +294,30 @@ async function init() {
             // Custom model loader will instantiate separatorModel and set isReady when bytes arrive
         } else {
             const separatorModelPath = modelPath || (prefix + 'models/biocppnet.onnx');
-            separatorModel = new ONNXAudioSeparator(separatorModelPath);
+            separatorModel = new ONNXAudioSeparator(separatorModelPath, runOnGPU);
             await separatorModel.loadModel();
         }
+
+        self.postMessage({
+            type: "PIPELINE_STATUS",
+            payload: {
+                status: "loading",
+                message: "Loading BirdNET classifier model..."
+            }
+        });
 
         // 3. Load TFLite Classification Model
         console.log("[Segmentation Worker] Loading BirdNET FP32 model...");
         classificationModel = await tflite.loadTFLiteModel(MODEL_PATH, { numThreads: 1 });
         console.log("[Segmentation Worker] BirdNET FP32 model loaded successfully.");
+
+        self.postMessage({
+            type: "PIPELINE_STATUS",
+            payload: {
+                status: "loading",
+                message: "Warming up classifier model..."
+            }
+        });
 
         // Warmup classification model
         try {
@@ -270,19 +355,15 @@ async function init() {
     }
 }
 
-async function loadLabels() {
-    const navigatorLang = params.get('lang');
+async function loadLabels(langOverride) {
     const supportedLanguages = [
         'af', 'da', 'en_us', 'fr', 'ja', 'no', 'ro', 'sl', 'tr', 'ar', 'de', 'es', 'hu',
         'ko', 'pl', 'ru', 'sv', 'uk', 'cs', 'en_uk', 'fi', 'it', 'nl', 'pt', 'sk', 'th', 'zh'
     ];
     
     const lang = (() => {
-        const req = params.get('lang');
-        if (req) return req;
-        if (!navigatorLang) return 'en_us';
-        const base = navigatorLang.split('-')[0];
-        return supportedLanguages.find(l => l.startsWith(base)) || 'en_us';
+        if (langOverride) return langOverride;
+        return 'en_us';
     })();
 
     try {
@@ -312,18 +393,17 @@ async function loadLabels() {
 function upsampleLinear(sourceBuffer, targetBuffer, sourceFs, targetFs) {
     const sourceLength = sourceBuffer.length;
     const targetLength = targetBuffer.length;
-    const ratio = (sourceLength - 1) / (targetLength - 1);
-
+    if (sourceLength === 0 || targetLength === 0) return;
+    
+    const ratio = sourceLength / targetLength;
     for (let i = 0; i < targetLength; i++) {
         const srcIndex = i * ratio;
         const baseIndex = Math.floor(srcIndex);
+        const nextIndex = Math.min(sourceLength - 1, baseIndex + 1);
+        const safeBaseIndex = Math.min(sourceLength - 1, baseIndex);
         const fraction = srcIndex - baseIndex;
-
-        if (baseIndex + 1 < sourceLength) {
-            targetBuffer[i] = sourceBuffer[baseIndex] * (1 - fraction) + sourceBuffer[baseIndex + 1] * fraction;
-        } else {
-            targetBuffer[i] = sourceBuffer[baseIndex];
-        }
+        
+        targetBuffer[i] = sourceBuffer[safeBaseIndex] * (1 - fraction) + sourceBuffer[nextIndex] * fraction;
     }
 }
 
@@ -331,8 +411,231 @@ function upsampleLinear(sourceBuffer, targetBuffer, sourceFs, targetFs) {
    5. MESSAGE HANDLING & PROCESS SEGMENT
    ========================================================================== */
 
+const segmentQueue = [];
+let isProcessingSegment = false;
+
+async function processNextSegment() {
+    if (isProcessingSegment) return;
+    if (segmentQueue.length === 0) return;
+
+    isProcessingSegment = true;
+    const { segmentId, timestamp, sampleRate, audioBuffer, meta } = segmentQueue.shift();
+
+    try {
+        await handleProcessSegment(segmentId, timestamp, sampleRate, audioBuffer, meta);
+    } catch (err) {
+        console.error("[Segmentation Worker] Critical error in segment processing pipeline:", err);
+    } finally {
+        isProcessingSegment = false;
+        // Schedule next segment processing
+        setTimeout(processNextSegment, 0);
+    }
+}
+
+async function handleProcessSegment(segmentId, timestamp, sampleRate, audioBuffer, meta) {
+    if (!isReady) {
+        console.warn(`[Segmentation Worker] Received segment ${segmentId} but worker is not ready yet.`);
+        self.postMessage({
+            type: "SEGMENT_RESULT",
+            payload: {
+                segmentId: segmentId,
+                timestamp: timestamp,
+                results: [],
+                noiseDetected: false,
+                error: "Worker not initialized"
+            }
+        });
+        return;
+    }
+
+    console.log(`[Segmentation Worker] Processing segment ${segmentId}. Samples: ${audioBuffer.length}`);
+    
+    try {
+        const isDSPFallback = separatorModel && separatorModel.hasFailedToLoad;
+        const modelSR = isDSPFallback ? SAMPLE_RATE : (currentOutputSampleRate || SAMPLE_RATE);
+        
+        // Symmetrical padding/truncation to ensure constant input shape for WebGPU (fixes JSEP compilation crash)
+        const targetLength = Math.round((currentPipelineBWindow || 9.0) * modelSR);
+        let separationInput = audioBuffer;
+        let originalSeparationLength = audioBuffer.length;
+        
+        // Resample input audio from SAMPLE_RATE (48000) to model native rate if needed
+        if (modelSR !== SAMPLE_RATE) {
+            const targetLen = Math.round(audioBuffer.length * (modelSR / SAMPLE_RATE));
+            const resampled = new Float32Array(targetLen);
+            upsampleLinear(audioBuffer, resampled, SAMPLE_RATE, modelSR);
+            separationInput = resampled;
+            originalSeparationLength = targetLen;
+            console.log(`[Segmentation Worker] Resampled input from ${SAMPLE_RATE}Hz (${audioBuffer.length} samples) to ${modelSR}Hz (${targetLen} samples) before separation.`);
+        } else {
+            originalSeparationLength = audioBuffer.length;
+        }
+
+        // Pad or truncate separationInput to exactly targetLength to prevent dynamic WebGPU compiles
+        if (separationInput.length !== targetLength) {
+            const paddedInput = new Float32Array(targetLength);
+            if (separationInput.length < targetLength) {
+                paddedInput.set(separationInput);
+                console.log(`[Segmentation Worker] Padded separation input from ${separationInput.length} to target ${targetLength} samples (constant shape for WebGPU).`);
+            } else {
+                paddedInput.set(separationInput.subarray(0, targetLength));
+                console.log(`[Segmentation Worker] Truncated separation input from ${separationInput.length} to target ${targetLength} samples.`);
+            }
+            separationInput = paddedInput;
+        }
+
+        // Step 1: Run source separation
+        const isolatedTracks = await separatorModel.separate(separationInput);
+        console.log(`[Segmentation Worker] Separation returned ${isolatedTracks.length} tracks.`);
+
+        const results = [];
+        
+        // Step 2: Classify each separated track
+        for (let tIdx = 0; tIdx < isolatedTracks.length; tIdx++) {
+            let track = isolatedTracks[tIdx];
+            
+            // Restore original resampled length by slicing or padding
+            if (track.length !== originalSeparationLength) {
+                if (originalSeparationLength < targetLength) {
+                    track = track.subarray(0, originalSeparationLength);
+                } else {
+                    const restored = new Float32Array(originalSeparationLength);
+                    restored.set(track);
+                    track = restored;
+                }
+            }
+            
+            // Resample track from model native rate to 48000Hz if needed
+            let processedTrack = track;
+            if (modelSR !== SAMPLE_RATE) {
+                const targetLen = Math.round(track.length * (SAMPLE_RATE / modelSR));
+                const resampled = new Float32Array(targetLen);
+                upsampleLinear(track, resampled, modelSR, SAMPLE_RATE);
+                processedTrack = resampled;
+                console.log(`[Segmentation Worker] Resampled track from ${modelSR}Hz (${track.length} samples) to ${SAMPLE_RATE}Hz (${targetLen} samples).`);
+            }
+            
+            // Peak normalize the track to normal range [-0.8, 0.8] for the classifier
+            let maxVal = 0;
+            for (let i = 0; i < processedTrack.length; i++) {
+                const abs = Math.abs(processedTrack[i]);
+                if (abs > maxVal) maxVal = abs;
+            }
+            if (maxVal > 0.0001) {
+                const gain = 0.8 / maxVal;
+                const clampedGain = Math.min(20.0, gain); // up to 20x gain boost
+                console.log(`[Segmentation Worker] Normalizing track ${tIdx} for classifier. Peak: ${maxVal.toFixed(4)}, Gain: ${clampedGain.toFixed(2)}x`);
+                for (let i = 0; i < processedTrack.length; i++) {
+                    processedTrack[i] = processedTrack[i] * clampedGain;
+                }
+            }
+            
+            const trackLen = processedTrack.length;
+
+            // Frame the track audio into 3-second slices with 1.5s hop size
+            const numFrames = Math.max(1, Math.ceil(Math.max(0, trackLen - WINDOW_SAMPLES) / HOP_SAMPLES) + 1);
+            const framed = new Float32Array(numFrames * WINDOW_SAMPLES);
+            for (let f = 0; f < numFrames; f++) {
+                const start = f * HOP_SAMPLES;
+                const srcEnd = Math.min(start + WINDOW_SAMPLES, trackLen);
+                framed.set(processedTrack.subarray(start, srcEnd), f * WINDOW_SAMPLES);
+            }
+
+            // Run inference frame by frame
+            const predictionList = [];
+            for (let f = 0; f < numFrames; f++) {
+                const slice = framed.subarray(f * WINDOW_SAMPLES, (f + 1) * WINDOW_SAMPLES);
+                const audioTensor = tf.tensor2d(slice, [1, WINDOW_SAMPLES], 'float32');
+                const resTensor = classificationModel.predict(audioTensor);
+                const predictions = await resTensor.array();
+                
+                // Apply sigmoid to convert raw logits to probabilities
+                const probabilities = predictions[0].map(val => 1 / (1 + Math.exp(-val)));
+                predictionList.push(probabilities);
+                audioTensor.dispose();
+                resTensor.dispose();
+            }
+
+            // Pool prediction results using Max Pooling (robust for transient bird calls in isolated channels)
+            const numClasses = predictionList[0]?.length || 0;
+            const pooledPredictions = new Float32Array(numClasses);
+            for (let i = 0; i < numClasses; i++) {
+                let maxVal = -Infinity;
+                for (let f = 0; f < numFrames; f++) {
+                    if (predictionList[f] && predictionList[f][i] > maxVal) {
+                        maxVal = predictionList[f][i];
+                    }
+                }
+                pooledPredictions[i] = maxVal;
+            }
+
+            // Map pooled predictions to sorted objects
+            const formattedPredictions = Array.from(pooledPredictions)
+                .map((confidence, idx) => ({
+                    speciesCode: birds[idx] ? birds[idx].scientificName : `class_${idx}`,
+                    commonName: birds[idx] ? (birds[idx].commonNameI18n || birds[idx].commonName) : `Class ${idx}`,
+                    scientificName: birds[idx] ? birds[idx].scientificName : `Class ${idx}`,
+                    confidence: confidence
+                }))
+                .sort((a, b) => b.confidence - a.confidence)
+                .slice(0, 10); // Keep top 10
+
+            console.log(`[Segmentation Worker] Track ${tIdx} top predictions:`, 
+                formattedPredictions.slice(0, 3).map(p => `${p.commonName} (${(p.confidence*100).toFixed(3)}%)`).join(', ')
+            );
+
+            results.push({
+                channelId: tIdx,
+                label: `separated_channel_${tIdx}`,
+                audioBuffer: processedTrack,
+                predictions: formattedPredictions
+            });
+        }
+
+        // Transfer separated audio buffers back to main thread to save memory
+        const transferList = results.map(r => r.audioBuffer.buffer);
+        // Also transfer the original audioBuffer back if it wasn't destroyed
+        if (audioBuffer && audioBuffer.buffer) {
+            transferList.push(audioBuffer.buffer);
+        }
+
+        self.postMessage({
+            type: "SEGMENT_RESULT",
+            payload: {
+                segmentId: segmentId,
+                timestamp: timestamp,
+                results: results,
+                noiseDetected: false,
+                error: null
+            }
+        }, transferList);
+        
+    } catch (err) {
+        console.error("[Segmentation Worker] Error processing segment:", err);
+        self.postMessage({
+            type: "SEGMENT_RESULT",
+            payload: {
+                segmentId: segmentId,
+                timestamp: timestamp,
+                results: [],
+                noiseDetected: false,
+                error: err.message
+            }
+        });
+    }
+}
+
 self.onmessage = async (event) => {
     const { type, payload } = event.data || {};
+
+    if (type === "INIT") {
+        const { separator, modelPath, runOnGPU, outputSampleRate, lang, logServerUrl, pipelineBWindow } = payload || {};
+        if (logServerUrl) {
+            setupRemoteLogging(logServerUrl);
+        }
+        await init(separator, modelPath, runOnGPU, outputSampleRate, lang, pipelineBWindow);
+        return;
+    }
 
     if (type === "UPDATE_CONFIG") {
         const { outputSampleRate } = payload || {};
@@ -373,131 +676,39 @@ self.onmessage = async (event) => {
     }
     
     if (type === "PROCESS_SEGMENT") {
-        const { segmentId, timestamp, sampleRate, audioBuffer, meta } = payload;
-        
-        if (!isReady) {
-            console.warn(`[Segmentation Worker] Received segment ${segmentId} but worker is not ready yet.`);
-            self.postMessage({
-                type: "SEGMENT_RESULT",
-                payload: {
-                    segmentId: segmentId,
-                    timestamp: timestamp,
-                    results: [],
-                    noiseDetected: false,
-                    error: "Worker not initialized"
-                }
-            });
-            return;
-        }
-
-        console.log(`[Segmentation Worker] Processing segment ${segmentId}. Samples: ${audioBuffer.length}`);
-        
-        try {
-            // Step 1: Run source separation
-            const isolatedTracks = await separatorModel.separate(audioBuffer);
-            console.log(`[Segmentation Worker] Separation returned ${isolatedTracks.length} tracks.`);
-
-            const results = [];
-            
-            // Step 2: Classify each separated track
-            for (let tIdx = 0; tIdx < isolatedTracks.length; tIdx++) {
-                const track = isolatedTracks[tIdx];
-                
-                // Resample track from model native rate to 48000Hz if needed
-                let processedTrack = track;
-                const modelSR = currentOutputSampleRate || SAMPLE_RATE;
-                if (modelSR !== SAMPLE_RATE) {
-                    const targetLen = Math.round(track.length * (SAMPLE_RATE / modelSR));
-                    const resampled = new Float32Array(targetLen);
-                    upsampleLinear(track, resampled, modelSR, SAMPLE_RATE);
-                    processedTrack = resampled;
-                    console.log(`[Segmentation Worker] Resampled track from ${modelSR}Hz (${track.length} samples) to ${SAMPLE_RATE}Hz (${targetLen} samples).`);
-                }
-                
-                const trackLen = processedTrack.length;
-
-                // Frame the track audio into 3-second slices with 1.5s hop size
-                const numFrames = Math.max(1, Math.ceil(Math.max(0, trackLen - WINDOW_SAMPLES) / HOP_SAMPLES) + 1);
-                const framed = new Float32Array(numFrames * WINDOW_SAMPLES);
-                for (let f = 0; f < numFrames; f++) {
-                    const start = f * HOP_SAMPLES;
-                    const srcEnd = Math.min(start + WINDOW_SAMPLES, trackLen);
-                    framed.set(processedTrack.subarray(start, srcEnd), f * WINDOW_SAMPLES);
-                }
-
-                // Run inference frame by frame
-                const predictionList = [];
-                for (let f = 0; f < numFrames; f++) {
-                    const slice = framed.subarray(f * WINDOW_SAMPLES, (f + 1) * WINDOW_SAMPLES);
-                    const audioTensor = tf.tensor2d(slice, [1, WINDOW_SAMPLES], 'float32');
-                    const resTensor = classificationModel.predict(audioTensor);
-                    const predictions = await resTensor.array();
-                    predictionList.push(predictions[0]);
-                    audioTensor.dispose();
-                    resTensor.dispose();
-                }
-
-                // Pool prediction results using Log-Mean-Exp
-                const numClasses = predictionList[0]?.length || 0;
-                const ALPHA = 5.0;
-                const sumsExp = new Float64Array(numClasses);
-                for (let f = 0; f < numFrames; f++) {
-                    const row = predictionList[f];
-                    for (let i = 0; i < numClasses; i++) {
-                        sumsExp[i] += Math.exp(ALPHA * row[i]);
-                    }
-                }
-                const pooledPredictions = Array.from(sumsExp, s => Math.log(s / numFrames) / ALPHA);
-
-                // Map pooled predictions to sorted objects
-                const formattedPredictions = pooledPredictions
-                    .map((confidence, idx) => ({
-                        speciesCode: birds[idx] ? birds[idx].scientificName : `class_${idx}`,
-                        commonName: birds[idx] ? (birds[idx].commonNameI18n || birds[idx].commonName) : `Class ${idx}`,
-                        scientificName: birds[idx] ? birds[idx].scientificName : `Class ${idx}`,
-                        confidence: confidence
-                    }))
-                    .sort((a, b) => b.confidence - a.confidence)
-                    .slice(0, 10); // Keep top 10
-
-                results.push({
-                    channelId: tIdx,
-                    label: `separated_channel_${tIdx}`,
-                    audioBuffer: processedTrack,
-                    predictions: formattedPredictions
-                });
-            }
-
-            // Transfer separated audio buffers back to main thread to save memory
-            const transferList = results.map(r => r.audioBuffer.buffer);
-            // Also transfer the original audioBuffer back if it wasn't destroyed
-            if (audioBuffer && audioBuffer.buffer) {
-                transferList.push(audioBuffer.buffer);
-            }
-
-            self.postMessage({
-                type: "SEGMENT_RESULT",
-                payload: {
-                    segmentId: segmentId,
-                    timestamp: timestamp,
-                    results: results,
-                    noiseDetected: false,
-                    error: null
-                }
-            }, transferList);
-            
-        } catch (err) {
-            console.error("[Segmentation Worker] Error processing segment:", err);
-            self.postMessage({
-                type: "SEGMENT_RESULT",
-                payload: {
-                    segmentId: segmentId,
-                    timestamp: timestamp,
-                    results: [],
-                    noiseDetected: false,
-                    error: err.message
-                }
-            });
-        }
+        segmentQueue.push(payload);
+        processNextSegment();
+        return;
     }
 };
+
+function setupRemoteLogging(url) {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+
+  console.log = (...args) => {
+    originalLog.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline B (Worker)', type: 'info', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
+  console.warn = (...args) => {
+    originalWarn.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline B (Worker)', type: 'warning', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
+  console.error = (...args) => {
+    originalError.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline B (Worker)', type: 'error', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
+}

@@ -209,3 +209,23 @@ body.drawer-open .record-btn {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
+
+/* Species details Wikipedia & eBird links */
+.species-link {
+  color: #6c757d;
+  text-decoration: none;
+  font-size: 0.75rem;
+  transition: color 0.15s ease-in-out;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 500;
+}
+.species-link:hover {
+  color: #0d6efd;
+  text-decoration: none;
+}
+.species-links-divider {
+  color: #dee2e6;
+  user-select: none;
+}

@@ -86,6 +86,7 @@ class AudioRouter {
         this.getSensitivity = options.getSensitivity || (() => 1.0);
         this.getGeoContext = options.getGeoContext || (() => ({}));
         this.onInferenceStart = options.onInferenceStart || (() => {});
+        this.onEarlyExit = options.onEarlyExit || null;
         this.getBConfig = options.getBConfig || (() => ({
             windowSize: 9.0,
             stride: 4.5,
@@ -187,6 +188,9 @@ class AudioRouter {
             if (bConfig.earlyExitEnabled && this.maxConfidenceInInterval >= bConfig.earlyExitConfidence) {
                 console.log(`[AudioRouter] Pipeline B: Bypassed via early exit (max live confidence: ${(this.maxConfidenceInInterval * 100).toFixed(1)}% >= ${(bConfig.earlyExitConfidence * 100).toFixed(0)}%)`);
                 this.maxConfidenceInInterval = 0; // reset for next interval
+                if (this.onEarlyExit) {
+                    this.onEarlyExit(pcm);
+                }
                 return;
             }
             this.maxConfidenceInInterval = 0; // reset for next interval

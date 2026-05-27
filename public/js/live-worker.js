@@ -8,9 +8,8 @@
    1. IMPORTS & CONFIGURATION
    ========================================================================== */
 
-const params = new URL(self.location.href).searchParams;
-const TF_PATH = params.get('tf') || 'js/tfjs-4.14.0.min.js';
-const prefix = self.location.origin + (params.get('prefix') || '/');
+const prefix = self.location.origin + self.location.pathname.substring(0, self.location.pathname.lastIndexOf('/js/')) + '/';
+const TF_PATH = prefix + 'js/tfjs-4.14.0.min.js';
 const TFLITE_PATH = prefix + 'js/tf-tflite.min.js';
 const WASM_PATH = prefix + 'tflite-wasm/';
 
@@ -51,10 +50,9 @@ let lastWindowSize = WINDOW_SAMPLES;
    3. INITIALIZATION
    ========================================================================== */
 
-// Start initialization immediately
-init();
+// Initialization is triggered via 'init' message from the main thread
 
-async function init() {
+async function init(langOverride) {
   // Use CPU backend for WASM TFLite operations
   await tf.setBackend('cpu');
 
@@ -93,13 +91,12 @@ async function init() {
 
   // 4. Load Labels
   postMessage({ message: 'load_labels', progress: 95 });
-  await loadLabels();
+  await loadLabels(langOverride);
 
   postMessage({ message: 'loaded' });
 }
 
 async function loadLabels(langOverride) {
-  const navigatorLang = params.get('lang');
   const supportedLanguages = [
     'af', 'da', 'en_us', 'fr', 'ja', 'no', 'ro', 'sl', 'tr', 'ar', 'de', 'es', 'hu',
     'ko', 'pl', 'ru', 'sv', 'uk', 'cs', 'en_uk', 'fi', 'it', 'nl', 'pt', 'sk', 'th', 'zh'
@@ -108,11 +105,7 @@ async function loadLabels(langOverride) {
   // Determine language
   const lang = (() => {
     if (langOverride) return langOverride;
-    const req = params.get('lang');
-    if (req) return req;
-    if (!navigatorLang) return 'en_us';
-    const base = navigatorLang.split('-')[0];
-    return supportedLanguages.find(l => l.startsWith(base)) || 'en_us';
+    return 'en_us';
   })();
 
   // Fetch default (English) and localized lists
@@ -153,6 +146,12 @@ async function loadLabels(langOverride) {
 
 onmessage = async ({ data }) => {
   switch (data.message) {
+    case 'init':
+      if (data.logServerUrl) {
+        setupRemoteLogging(data.logServerUrl);
+      }
+      await init(data.lang);
+      break;
     case 'predict':
       await handlePredict(data);
       break;
@@ -192,7 +191,25 @@ async function handlePredict(data) {
   const hopSamples = Math.max(1, WINDOW_SAMPLES - overlapSamples);
 
   const pcm = data.pcmAudio || new Float32Array(0);
-  const total = pcm.length;
+
+  // Peak normalize the input audio to normal range [-0.8, 0.8] for the classifier
+  let maxVal = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const abs = Math.abs(pcm[i]);
+    if (abs > maxVal) maxVal = abs;
+  }
+  let processedPcm = pcm;
+  if (maxVal > 0.0001) {
+    const gain = 0.8 / maxVal;
+    const clampedGain = Math.min(20.0, gain); // up to 20x gain boost
+    processedPcm = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      processedPcm[i] = pcm[i] * clampedGain;
+    }
+    console.log(`[Live Worker] Peak-normalized audio for classifier. Peak: ${maxVal.toFixed(4)}, Gain: ${clampedGain.toFixed(2)}x`);
+  }
+
+  const total = processedPcm.length;
 
   // Frame the audio (sliding window)
   const numFrames = Math.max(1, Math.ceil(Math.max(0, total - WINDOW_SAMPLES) / hopSamples) + 1);
@@ -200,7 +217,7 @@ async function handlePredict(data) {
   for (let f = 0; f < numFrames; f++) {
     const start = f * hopSamples;
     const srcEnd = Math.min(start + WINDOW_SAMPLES, total);
-    framed.set(pcm.subarray(start, srcEnd), f * WINDOW_SAMPLES);
+    framed.set(processedPcm.subarray(start, srcEnd), f * WINDOW_SAMPLES);
   }
 
   // 2. Run Inference
@@ -213,8 +230,9 @@ async function handlePredict(data) {
     const resTensor = birdModel.predict(audioTensor);
     const predictions = await resTensor.array();
     
-    // push row 0 to predictionList
-    predictionList.push(predictions[0]);
+    // Apply sigmoid to convert raw logits to probabilities
+    const probabilities = predictions[0].map(val => 1 / (1 + Math.exp(-val)));
+    predictionList.push(probabilities);
     
     audioTensor.dispose();
     resTensor.dispose();
@@ -337,4 +355,35 @@ async function handleAreaScores(data) {
     }));
     postMessage({ message: 'pooled', pooled });
   }
+}
+
+function setupRemoteLogging(url) {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+
+  console.log = (...args) => {
+    originalLog.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline A (Worker)', type: 'info', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
+  console.warn = (...args) => {
+    originalWarn.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline A (Worker)', type: 'warning', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
+  console.error = (...args) => {
+    originalError.apply(console, args);
+    fetch(`${url}/api/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'Pipeline A (Worker)', type: 'error', message: args.map(String).join(' ') })
+    }).catch(() => {});
+  };
 }

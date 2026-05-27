@@ -1,0 +1,566 @@
+---
+title: "Pipeline programmatic test"
+permalink: "/test-pipeline/"
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pipeline programmatic test</title>
+</head>
+<body style="background: #0f172a; color: #f8fafc; font-family: monospace; padding: 20px;">
+  <h2>BirdNET Live - Programmatic Pipeline Test</h2>
+  <div id="status" style="font-weight: bold; margin-bottom: 10px; color: #38bdf8;">Loading...</div>
+  <pre id="output" style="background: #020617; padding: 15px; border-radius: 8px; overflow: auto; max-height: 80vh; border: 1px solid #1e293b;"></pre>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const outputEl = document.getElementById('output');
+
+    function logLocal(msg, type = 'info') {
+      const span = document.createElement('div');
+      span.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (type === 'error') span.style.color = '#ef4444';
+      else if (type === 'success') span.style.color = '#22c55e';
+      else if (type === 'warning') span.style.color = '#f59e0b';
+      outputEl.appendChild(span);
+      outputEl.scrollTop = outputEl.scrollHeight;
+    }
+
+    // Capture logs and send to Node server
+    function sendLog(source, type, message) {
+      fetch('/api/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source, type, message })
+      }).catch(() => {});
+    }
+
+    // Override console
+    const orgLog = console.log;
+    const orgWarn = console.warn;
+    const orgErr = console.error;
+
+    console.log = (...args) => {
+      orgLog.apply(console, args);
+      const msg = args.map(String).join(' ');
+      logLocal(msg, 'info');
+      sendLog('Main', 'info', msg);
+    };
+    console.warn = (...args) => {
+      orgWarn.apply(console, args);
+      const msg = args.map(String).join(' ');
+      logLocal(msg, 'warning');
+      sendLog('Main', 'warning', msg);
+    };
+    console.error = (...args) => {
+      orgErr.apply(console, args);
+      const msg = args.map(String).join(' ');
+      logLocal(msg, 'error');
+      sendLog('Main', 'error', msg);
+    };
+
+    window.onerror = (message, source, lineno, colno, error) => {
+      const errStr = `${message} at ${source}:${lineno}:${colno}`;
+      console.error(errStr);
+      fetch('/api/error', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: errStr })
+      }).catch(() => {});
+    };
+  </script>
+
+  <script>
+    // Run the pipeline
+    async function runTest() {
+      try {
+        statusEl.textContent = "Fetching '/test.wav'...";
+        console.log("Fetching test audio file '/test.wav'...");
+        const res = await fetch('/test.wav');
+        if (!res.ok) {
+          throw new Error("Could not fetch test audio file '/test.wav'. Make sure it exists in public/ or is copied to _site/test.wav.");
+        }
+        const arrayBuffer = await res.arrayBuffer();
+        statusEl.textContent = "Decoding audio...";
+        console.log("Audio file fetched successfully. Decoding...");
+
+        const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const decodedBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+        tempCtx.close();
+
+        const duration = decodedBuffer.duration;
+        console.log(`Audio decoded: duration ${duration.toFixed(2)}s, sampleRate ${decodedBuffer.sampleRate}Hz`);
+
+        // Resample to 48kHz mono
+        statusEl.textContent = "Resampling to 48kHz...";
+        console.log("Resampling to 48kHz mono...");
+        const SAMPLE_RATE = 48000;
+        const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * SAMPLE_RATE), SAMPLE_RATE);
+        const sourceNode = offlineCtx.createBufferSource();
+        sourceNode.buffer = decodedBuffer;
+        sourceNode.connect(offlineCtx.destination);
+        sourceNode.start();
+        const resampledBuffer = await offlineCtx.startRendering();
+        const audioBuffer48k = resampledBuffer.getChannelData(0);
+        console.log(`Audio resampled: length ${audioBuffer48k.length} samples.`);
+
+        // Parse query params to allow customization of test configuration
+        const urlParams = new URLSearchParams(window.location.search);
+        const selectedSeparatorModel = urlParams.get('separator') || 'bird_mixit_4source';
+        const separatorPrecision = urlParams.get('precision') || 'fp32';
+        const webgpuEnabled = urlParams.get('webgpu') !== 'false';
+        const aadEnabled = urlParams.get('aad') !== 'false';
+        const aadRmsThreshold = parseFloat(urlParams.get('aadRms') || '0.010');
+        const aadCentroidMin = parseFloat(urlParams.get('aadCentroid') || '1000');
+        const earlyExitEnabled = urlParams.get('earlyExit') !== 'false';
+        const earlyExitConfidence = parseFloat(urlParams.get('earlyExitConf') || '0.90');
+        const pipelineBWindow = parseFloat(urlParams.get('window') || '9.0');
+        const pipelineBStride = parseFloat(urlParams.get('stride') || '4.5');
+        const detectionThreshold = parseFloat(urlParams.get('threshold') || '0.15');
+
+        // Setup workers
+        const prefix = window.PATH_PREFIX || "/";
+        const liveWorker = new Worker(prefix + "js/live-worker.js");
+        const segmentationWorker = new Worker(prefix + "js/segmentation-worker.js");
+
+        let liveWorkerReady = false;
+        let segmentationWorkerReady = false;
+        let activePipelineARequests = 0;
+        let activePipelineBRequests = 0;
+        let isTimelineFeedFinished = false;
+
+        const verifiedDetections = new Map();
+        const pendingDetections = new Map();
+        let latestDetections = [];
+
+        let maxLiveConfidenceInInterval = 0;
+
+        // Path to model
+        let modelPath = "";
+        let modelSR = 48000;
+        if (selectedSeparatorModel !== "dsp" && selectedSeparatorModel !== "custom") {
+          if (selectedSeparatorModel === "bird_mixit_4source") {
+            modelPath = prefix + "models/bird_mixit_4source.onnx";
+            modelSR = 22050;
+          } else {
+            // biocppnet fallback
+            modelPath = prefix + "models/biocppnet.onnx";
+            modelSR = 48000;
+          }
+        }
+
+        // Initialize workers with configuration (we pass the log server URL so they can override their console)
+        const logServerUrl = window.location.origin;
+        console.log(`Initializing Live Worker...`);
+        liveWorker.postMessage({
+          message: 'init',
+          lang: 'en_us',
+          logServerUrl: logServerUrl
+        });
+
+        console.log(`Initializing Segmentation Worker (model: ${selectedSeparatorModel})...`);
+        segmentationWorker.postMessage({
+          type: 'INIT',
+          payload: {
+            separator: selectedSeparatorModel,
+            modelPath: modelPath,
+            runOnGPU: webgpuEnabled,
+            outputSampleRate: modelSR,
+            lang: 'en_us',
+            logServerUrl: logServerUrl,
+            pipelineBWindow: pipelineBWindow
+          }
+        });
+
+        // Set up worker error handling
+        liveWorker.onerror = (e) => {
+          console.error(`[Pipeline A Worker Error] ${e.message || "Failed to load/run"}`);
+          fetch('/api/error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ error: `Pipeline A Error: ${e.message}` })
+          }).catch(() => {});
+        };
+        segmentationWorker.onerror = (e) => {
+          console.error(`[Pipeline B Worker Error] ${e.message || "Failed to load/run"}`);
+          fetch('/api/error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ error: `Pipeline B Error: ${e.message}` })
+          }).catch(() => {});
+        };
+
+        // Worker messages
+        liveWorker.onmessage = (event) => {
+          const data = event.data || {};
+          switch (data.message) {
+            case "load_model":
+            case "warmup":
+            case "load_geomodel":
+            case "load_labels":
+              console.log(`[Pipeline A Status] ${data.message} (progress: ${data.progress}%)`);
+              break;
+            case "loaded":
+              console.log(`[Pipeline A] Ready.`);
+              liveWorkerReady = true;
+              checkReadyAndStart();
+              break;
+            case "pooled":
+              activePipelineARequests--;
+              if (Array.isArray(data.pooled)) {
+                // Log top 3 raw predictions for visibility
+                const sorted = [...data.pooled].sort((a, b) => b.confidence - a.confidence);
+                console.log(`[Pipeline A Top Predictions]`);
+                sorted.slice(0, 3).forEach((p, idx) => {
+                  console.log(`  #${idx + 1}: ${p.commonName} (${p.scientificName}) - Conf: ${(p.confidence * 100).toFixed(1)}%`);
+                });
+
+                let maxConf = 0;
+                const now = Date.now();
+                data.pooled.forEach(p => {
+                  if (p.confidence > maxConf) maxConf = p.confidence;
+                  if (p.confidence >= detectionThreshold && p.scientificName) {
+                    if (!verifiedDetections.has(p.scientificName) && !pendingDetections.has(p.scientificName)) {
+                      pendingDetections.set(p.scientificName, now);
+                      console.log(`[Pipeline A Draft] ${p.commonName} (${(p.confidence * 100).toFixed(0)}%)`);
+                      latestDetections.push({
+                        scientificName: p.scientificName,
+                        commonName: p.commonName,
+                        confidence: p.confidence,
+                        verified: false
+                      });
+                    }
+                  }
+                });
+                maxLiveConfidenceInInterval = Math.max(maxLiveConfidenceInInterval, maxConf);
+              }
+              checkIfFinished();
+              break;
+            case "worker_error":
+              activePipelineARequests--;
+              console.error(`[Pipeline A Error] ${data.error}`);
+              checkIfFinished();
+              break;
+          }
+        };
+
+        segmentationWorker.onmessage = (event) => {
+          const { type, payload } = event.data || {};
+          if (type === "PIPELINE_STATUS") {
+            console.log(`[Pipeline B Status] ${payload.status}: ${payload.message}`);
+            if (payload.status === "ready") {
+              segmentationWorkerReady = true;
+              checkReadyAndStart();
+            } else if (payload.status === "error") {
+              console.error(`[Pipeline B Init Error] ${payload.message}`);
+            }
+          } else if (type === "SEGMENT_RESULT") {
+            activePipelineBRequests--;
+            const { segmentId, timestamp, results, error } = payload || {};
+            if (error) {
+              console.error(`[Pipeline B Segment Error] segment ${segmentId}: ${error}`);
+              checkIfFinished();
+              return;
+            }
+            console.log(`[Pipeline B Completed] segment ${segmentId}`);
+            if (results && results.length > 0) {
+              // Log top 3 raw predictions for each channel for visibility
+              results.forEach(res => {
+                if (res.predictions && res.predictions.length > 0) {
+                  console.log(`  [Channel ${res.channelId} Top Predictions]`);
+                  res.predictions.slice(0, 3).forEach((pred, idx) => {
+                    console.log(`    #${idx + 1}: ${pred.commonName} (${pred.scientificName}) - Conf: ${(pred.confidence * 100).toFixed(1)}%`);
+                  });
+                }
+              });
+
+              const verifiedThisSegment = new Set();
+              results.forEach(res => {
+                if (res.predictions && res.predictions.length > 0) {
+                  res.predictions.forEach(pred => {
+                    if (pred.scientificName && pred.confidence >= detectionThreshold) {
+                      console.log(`[Consensus VERIFIED] ${pred.commonName} (${(pred.confidence * 100).toFixed(1)}%)`);
+                      verifiedDetections.set(pred.scientificName, {
+                        confidence: pred.confidence,
+                        timestamp: timestamp
+                      });
+
+                      // Post the isolated track to the server to save as WAV
+                      if (res.audioBuffer) {
+                        const audioArr = Array.from(res.audioBuffer);
+                        fetch('/api/save_separated', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            species: pred.scientificName,
+                            channelId: res.channelId,
+                            sampleRate: SAMPLE_RATE,
+                            audioData: audioArr
+                          })
+                        }).catch(() => {});
+                      }
+
+                      verifiedThisSegment.add(pred.scientificName);
+                      pendingDetections.delete(pred.scientificName);
+
+                      // Update latestDetections to show verified status
+                      const match = latestDetections.find(d => d.scientificName === pred.scientificName);
+                      if (match) {
+                        match.verified = true;
+                        match.confidence = Math.max(match.confidence, pred.confidence);
+                      } else {
+                        latestDetections.push({
+                          scientificName: pred.scientificName,
+                          commonName: pred.commonName,
+                          confidence: pred.confidence,
+                          verified: true
+                        });
+                      }
+                    }
+                  });
+                }
+              });
+
+              // Reconcile pending
+              const segmentStart = timestamp - (pipelineBWindow * 1000);
+              const segmentEnd = timestamp;
+              pendingDetections.forEach((detectedAt, sciName) => {
+                if (detectedAt >= segmentStart && detectedAt <= segmentEnd) {
+                  if (!verifiedThisSegment.has(sciName)) {
+                    console.log(`[Consensus REJECTED] False positive: ${sciName}`);
+                    pendingDetections.delete(sciName);
+                    latestDetections = latestDetections.filter(d => d.scientificName !== sciName);
+                  }
+                }
+              });
+            }
+            checkIfFinished();
+          }
+        };
+
+        function checkReadyAndStart() {
+          if (liveWorkerReady && segmentationWorkerReady) {
+            statusEl.textContent = "Scanning...";
+            console.log("Both pipelines ready. Starting scan...");
+            startScanning();
+          }
+        }
+
+        let scanTimeSec = 0;
+        let scanIntervalId = null;
+        const simulatedEpochStart = 1000000000000;
+        const WINDOW_SAMPLES = 144000;
+
+        function startScanning() {
+          let nextPipelineBTime = pipelineBWindow;
+          
+          // For short files, run Pipeline B immediately
+          if (duration < pipelineBWindow) {
+            console.log(`Short file (${duration.toFixed(2)}s) detected. Triggering Pipeline B immediately...`);
+            const copy = new Float32Array(audioBuffer48k);
+            const simulatedTimestamp = simulatedEpochStart + duration * 1000;
+            activePipelineBRequests++;
+            segmentationWorker.postMessage({
+              type: "PROCESS_SEGMENT",
+              payload: {
+                segmentId: `seg-test-short-${simulatedTimestamp}`,
+                timestamp: simulatedTimestamp,
+                sampleRate: SAMPLE_RATE,
+                audioBuffer: copy,
+                meta: {}
+              }
+            }, [copy.buffer]);
+          }
+
+          // Scan pacing (fast programmatically)
+          const timeStepSec = 0.5;
+          scanIntervalId = setInterval(() => {
+            scanTimeSec += timeStepSec;
+
+            if (scanTimeSec > duration) {
+              clearInterval(scanIntervalId);
+              scanIntervalId = null;
+
+              // Final Pipeline A slice
+              if (duration >= 3.0) {
+                const startSample = audioBuffer48k.length - WINDOW_SAMPLES;
+                const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
+                const copy = new Float32Array(slice);
+                activePipelineARequests++;
+                liveWorker.postMessage({
+                  message: "predict",
+                  pcmAudio: copy,
+                  overlapSec: 1.5,
+                  sensitivity: 1.0
+                }, [copy.buffer]);
+              } else {
+                const slice = new Float32Array(WINDOW_SAMPLES);
+                slice.set(audioBuffer48k);
+                activePipelineARequests++;
+                liveWorker.postMessage({
+                  message: "predict",
+                  pcmAudio: slice,
+                  overlapSec: 1.5,
+                  sensitivity: 1.0
+                });
+              }
+
+              // Final Pipeline B slice
+              if (duration >= pipelineBWindow) {
+                const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
+                const startSample = audioBuffer48k.length - windowSamples;
+                const slice = audioBuffer48k.subarray(startSample, audioBuffer48k.length);
+                const copy = new Float32Array(slice);
+                activePipelineBRequests++;
+                const simulatedTimestamp = simulatedEpochStart + duration * 1000;
+                segmentationWorker.postMessage({
+                  type: "PROCESS_SEGMENT",
+                  payload: {
+                    segmentId: `seg-test-final-${simulatedTimestamp}`,
+                    timestamp: simulatedTimestamp,
+                    sampleRate: SAMPLE_RATE,
+                    audioBuffer: copy,
+                    meta: {}
+                  }
+                }, [copy.buffer]);
+              }
+
+              isTimelineFeedFinished = true;
+              checkIfFinished();
+              return;
+            }
+
+            // Calculations
+            const endSample = Math.round(scanTimeSec * SAMPLE_RATE);
+
+            // Pipeline A: every 1.0s
+            if (Number.isInteger(scanTimeSec) && scanTimeSec >= 3.0) {
+              const startSample = endSample - WINDOW_SAMPLES;
+              if (startSample >= 0 && startSample + WINDOW_SAMPLES <= audioBuffer48k.length) {
+                const slice = audioBuffer48k.subarray(startSample, startSample + WINDOW_SAMPLES);
+                const copy = new Float32Array(slice);
+                activePipelineARequests++;
+                liveWorker.postMessage({
+                  message: "predict",
+                  pcmAudio: copy,
+                  overlapSec: 1.5,
+                  sensitivity: 1.0
+                }, [copy.buffer]);
+              }
+            }
+
+            // Pipeline B
+            if (scanTimeSec >= nextPipelineBTime - 0.001) {
+              const windowSamples = Math.round(pipelineBWindow * SAMPLE_RATE);
+              const startSample = endSample - windowSamples;
+              if (startSample >= 0 && startSample + windowSamples <= audioBuffer48k.length) {
+                const slice = audioBuffer48k.subarray(startSample, startSample + windowSamples);
+                
+                let bypassB = false;
+
+                // AAD
+                if (aadEnabled) {
+                  const rms = calculateRMS(slice);
+                  const centroid = calculateSpectralCentroid(slice, SAMPLE_RATE);
+                  if (rms < aadRmsThreshold || centroid < aadCentroidMin) {
+                    console.log(`[Pipeline B] Gate bypass at ${scanTimeSec.toFixed(1)}s (rms: ${rms.toFixed(4)}, centroid: ${Math.round(centroid)}Hz)`);
+                    bypassB = true;
+                  }
+                }
+
+                // Early exit
+                if (!bypassB && earlyExitEnabled && maxLiveConfidenceInInterval >= earlyExitConfidence) {
+                  console.log(`[Pipeline B] Early exit bypass at ${scanTimeSec.toFixed(1)}s (live conf: ${maxLiveConfidenceInInterval.toFixed(2)})`);
+                  bypassB = true;
+                }
+
+                maxLiveConfidenceInInterval = 0;
+
+                if (!bypassB) {
+                  const copy = new Float32Array(slice);
+                  const simulatedTimestamp = simulatedEpochStart + scanTimeSec * 1000;
+                  activePipelineBRequests++;
+                  segmentationWorker.postMessage({
+                    type: "PROCESS_SEGMENT",
+                    payload: {
+                      segmentId: `seg-test-${simulatedTimestamp}`,
+                      timestamp: simulatedTimestamp,
+                      sampleRate: SAMPLE_RATE,
+                      audioBuffer: copy,
+                      meta: {}
+                    }
+                  }, [copy.buffer]);
+                }
+              }
+              nextPipelineBTime += pipelineBStride;
+            }
+
+          }, 10);
+        }
+
+        // AAD math helpers
+        function calculateRMS(arr) {
+          let sum = 0;
+          for (let i = 0; i < arr.length; i++) sum += arr[i] * arr[i];
+          return Math.sqrt(sum / arr.length);
+        }
+
+        function calculateSpectralCentroid(arr, sampleRate) {
+          let crossings = 0;
+          for (let i = 1; i < arr.length; i++) {
+            if ((arr[i] >= 0 && arr[i-1] < 0) || (arr[i] < 0 && arr[i-1] >= 0)) {
+              crossings++;
+            }
+          }
+          return (crossings / 2) * (sampleRate / arr.length);
+        }
+
+        function checkIfFinished() {
+          if (isTimelineFeedFinished && activePipelineARequests === 0 && activePipelineBRequests === 0) {
+            statusEl.textContent = "Finished!";
+            statusEl.style.color = "#22c55e";
+            console.log("Analysis complete!");
+
+            // Reconcile remaining
+            pendingDetections.forEach((detectedAt, sciName) => {
+              console.log(`[Cleanup] Removing unverified: ${sciName}`);
+              latestDetections = latestDetections.filter(d => d.scientificName !== sciName);
+            });
+            pendingDetections.clear();
+
+            // Print summary
+            console.log("\n--- Final Consensus Results Summary ---");
+            latestDetections.forEach(d => {
+              console.log(`${d.verified ? '[VERIFIED]' : '[DRAFT]'} ${d.commonName} (${d.scientificName}) - Conf: ${(d.confidence * 100).toFixed(1)}%`);
+            });
+            console.log("---------------------------------------\n");
+
+            // Post back results
+            fetch('/api/complete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ results: latestDetections })
+            }).catch(() => {});
+
+            // Terminate workers
+            liveWorker.terminate();
+            segmentationWorker.terminate();
+          }
+        }
+
+      } catch (err) {
+        console.error(err);
+        fetch('/api/error', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: err.message })
+        }).catch(() => {});
+      }
+    }
+
+    // Run automatically on load
+    window.addEventListener('DOMContentLoaded', runTest);
+  </script>
+</body>
+</html>

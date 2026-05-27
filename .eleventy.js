@@ -29,9 +29,13 @@ module.exports = function (eleventyConfig) {
   });
   eleventyConfig.addPassthroughCopy({
     "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm": "onnx-wasm/ort-wasm-simd-threaded.wasm",
+    "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs": "onnx-wasm/ort-wasm-simd-threaded.mjs",
     "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm": "onnx-wasm/ort-wasm-simd-threaded.jsep.wasm",
+    "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs": "onnx-wasm/ort-wasm-simd-threaded.jsep.mjs",
     "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jspi.wasm": "onnx-wasm/ort-wasm-simd-threaded.jspi.wasm",
+    "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jspi.mjs": "onnx-wasm/ort-wasm-simd-threaded.jspi.mjs",
     "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm": "onnx-wasm/ort-wasm-simd-threaded.asyncify.wasm",
+    "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs": "onnx-wasm/ort-wasm-simd-threaded.asyncify.mjs",
   });
 
   return {
